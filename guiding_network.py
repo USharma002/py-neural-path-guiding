@@ -130,36 +130,3 @@ class GuidingNetwork(nn.Module):
         raw_output = self.model(input_tensor.contiguous())
         
         return self.network_output_to_params(raw_output)
-
-if __name__ == "__main__":
-    # --- Setup ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    K = 8
-    batch_size = 10_000
-    
-    gnn = GuidingNetwork(device=device, K=K)
-
-    # --- Create Dummy Input ---
-    positions = torch.randn((batch_size, 3), device=device)
-    view_dirs = torch.randn((batch_size, 3), device=device)
-    view_dirs = nn.functional.normalize(view_dirs, dim=-1)
-    roughness = torch.rand((batch_size, 1), device=device)
-
-    # --- Query the Network ---
-    vmf_params = gnn.query(positions, view_dirs, roughness)
-    print(vmf_params.keys())
-
-    # --- Print Shapes and Verify ---
-    print("Successfully converted network output to vMF parameters.")
-    print(f"Mixture Weights Shape: {vmf_params['lambda'].shape}") # Expected: (10000, 8)
-    print(f"Concentration (kappa) Shape: {vmf_params['kappa'].shape}") # Expected: (10000, 8)
-    print(f"Theta Shape: {vmf_params['theta'].shape}") # Expected: (10000, 8)
-    print(f"Phi Shape: {vmf_params['phi'].shape}") # Expected: (10000, 8)
-
-    # Check if weights sum to 1
-    print(f"Weights for first query point sum to: {vmf_params['lambda'][0].sum().item():.4f}")
-
-    # Check if mu vectors are normalized
-    # mu_norms = torch.linalg.norm(vmf_params['mu'][0], dim=-1)
-    # print("Norms of mu vectors for first query point:")
-    # print(mu_norms)

@@ -12,8 +12,6 @@ device = "cuda"
 mi.set_variant("cuda_ad_rgb")
 dr.set_log_level(dr.LogLevel.Warn)
 
-
-
 class Renderer:
 	def __init__(self):
 		self.guiding = False

@@ -30,7 +30,10 @@ custom_render = Renderer().render
 
 # Set Mitsuba variant
 mi.set_variant('cuda_ad_rgb')
-# mi.set_log_level(mi.LogLevel.Warn)
+mi.set_log_level(mi.LogLevel.Warn)
+
+dr.set_flag(dr.JitFlag.LoopRecord, False)
+dr.set_flag(dr.JitFlag.VCallRecord, False)
 
 device = "cuda"
 
@@ -42,53 +45,40 @@ def spherical_to_cartesian_torch(theta, phi):
     z = torch.cos(theta)
     return torch.stack([x, y, z], dim=-1)
 
-def plot_non_batched_mixture(vmf, resolution=(256, 256), device='cuda'):
-    """
-    Generates an image by evaluating a function over the sphere, using the same
-    mapping as the SphericalCamera.
-
-    Args:
-        func (callable): A function that takes a [N, 3] torch tensor of world-space
-                         directions and returns a [N] tensor of values.
-        resolution (tuple): The (width, height) of the output image.
-        device (str): The torch device.
-
-    Returns:
-        np.ndarray: A float32 RGB image array of the visualization.
-    """
+def plot_non_batched_mixture(vmf, si, resolution=(256, 256), device='cuda'):
     width, height = resolution
     
-    # 1. Create a grid of (u, v) coordinates corresponding to pixel positions.
+    # 1. Create a high-resolution grid in WORLD space using PyTorch.
     u_coords = torch.linspace(0, 1, width, device=device)
     v_coords = torch.linspace(0, 1, height, device=device)
-    # Note: 'ij' indexing means the first dimension corresponds to v (height)
     vv, uu = torch.meshgrid(v_coords, u_coords, indexing='ij')
 
-    # 2. Convert (u, v) to world directions using the EXACT same math as the camera's warp
-    phi = uu * 2 * math.pi
-    # The formula `acos(1 - 2*v)` is the inverse of the CDF used for uniform sphere sampling
-    theta = torch.acos(1 - 2 * vv)
+    phi = uu.ravel() * 2 * math.pi
+    theta = torch.acos(1 - 2 * vv.ravel())
 
-    # dirs_world is a [height, width, 3] tensor
     dirs_world = spherical_to_cartesian_torch(theta, phi)
 
-    # 3. Evaluate the provided function on the flattened grid of directions
-    values = vmf.pdf(dirs_world.reshape(-1, 3))
+    n = si.n.torch().to(device)
+    s = si.sh_frame.s.torch().to(device)
+    t = si.sh_frame.t.torch().to(device)
+
+    local_x = torch.sum(dirs_world * s, dim=-1)
+    local_y = torch.sum(dirs_world * t, dim=-1)
+    local_z = torch.sum(dirs_world * n, dim=-1)
     
-    # 4. Reshape and colorize the result to create an image
-    value_grid = values.reshape(height, width).detach().cpu().numpy()
+    dirs_local = torch.stack([local_x, local_y, local_z], dim=-1)
+
+    pdf_values = vmf.pdf(dirs_local)
     
-    # Normalize for visualization
+    value_grid = pdf_values.reshape(height, width).detach().cpu().numpy()
+    
     max_val = np.max(value_grid)
-    if max_val > 0:
+    if max_val > 1e-6:
         value_grid /= max_val
-        
-    colored_rgb = cm.magma(value_grid)[..., :3]
     
+    colored_rgb = cm.magma(value_grid)[..., :3]
     return colored_rgb
 
-
-# --- Use the more robust numpy_to_qpixmap function ---
 def numpy_to_qpixmap(numpy_array):
     if numpy_array is None:
         return QPixmap()
@@ -151,7 +141,7 @@ class MitsubaViewer(QMainWindow):
         self.cosine_checkbox = QCheckBox("Cosine Product")
         self.bsdf_checkbox = QCheckBox("BSDF Product")
         self.guiding_checkbox = QCheckBox("Path Guiding")
-        self.bsdf_checkbox.setChecked(True)  # Default enabled (as per your earlier logic)
+        self.bsdf_checkbox.setChecked(True)
 
         self.checkbox_layout.addWidget(self.cosine_checkbox)
         self.checkbox_layout.addWidget(self.bsdf_checkbox)
@@ -336,7 +326,7 @@ class MitsubaViewer(QMainWindow):
         s_torch = si.sh_frame.s.torch().to(device)
         t_torch = si.sh_frame.t.torch().to(device)
 
-        vmf_img_np = plot_non_batched_mixture(guiding_dist, device=device)
+        vmf_img_np = plot_non_batched_mixture(guiding_dist, si, device=device)
         hover_image_np = np.transpose(vmf_img_np, (1, 0, 2))  
 
         self.vmf_view.setPixmap(numpy_to_qpixmap(vmf_img_np))
@@ -390,11 +380,10 @@ class MitsubaViewer(QMainWindow):
 
     def reprocess_last_click(self):
         if self.last_click_coords is None:
-            return  # No previous click
+            return 
 
         x, y = self.last_click_coords
 
-        # Create a fake mouse event using QPointF
         local_pos = QPointF(x, y)
         global_pos = QPointF(self.main_view.mapToGlobal(QPoint(x, y)))
 

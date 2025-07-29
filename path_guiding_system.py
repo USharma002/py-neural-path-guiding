@@ -1,5 +1,3 @@
-# You can put this in a new file, e.g., guiding_system.py
-
 import torch
 from guiding_network import GuidingNetwork
 from vmf_mixture import BatchedMixedSphericalGaussianDistribution
@@ -7,8 +5,6 @@ from typing import Tuple
 
 import drjit as dr
 from math_utils import *
-# Assuming your PathGuidingIntegrator is importable or defined
-# from path_guiding_integrator import PathGuidingIntegrator
 
 class PathGuidingSystem:
     def __init__(self, device: str = "cuda", K: int = 20, learning_rate: float = 2e-5):
@@ -53,13 +49,9 @@ class PathGuidingSystem:
 
         if pos is None:
             print("Warning: Skipping training step due to no valid data.")
-            return -1.0 # Or some other indicator of no training
+            return -1.0
 
-        # Step 2: Set network to training mode
         self.gnn.train()
-
-        # Step 3: Perform the forward and backward pass
-        # --- (This is the training logic you already perfected) ---
         
         # Get the network's predicted distribution for all N samples
         predicted_params = self.gnn(pos, wo, roughness)
@@ -84,20 +76,7 @@ class PathGuidingSystem:
         log_prob = torch.log(prob + epsilon)
         mle_loss = -importance_weight * log_prob
 
-        # 2. Entropy Bonus (we want to MAXIMIZE entropy, so we subtract it from the loss)
-        # The alpha hyperparameter controls the strength of the regularization. Start small.
-        entropy_alpha = 0.05
-        entropy_bonus = predicted_dist.entropy()
-
-        mus = spherical_to_cartesian(predicted_dist.thetas, predicted_dist.phis) # (1, K, 3)
-        # Calculate pairwise cosine similarity between lobe means
-        pairwise_similarity = torch.matmul(mus, mus.transpose(-1, -2)) # (1, K, K)
-        # Create an identity matrix to zero out self-similarity (diagonal)
-        eye = torch.eye(self.gnn.K, device="cuda").unsqueeze(0) # (1, K, K)
-        # Take the absolute value of off-diagonal similarities and average them
-        repulsion_loss = torch.mean(torch.abs(pairwise_similarity * (1 - eye)))
-
-        loss = torch.mean(mle_loss - entropy_alpha * entropy_bonus) + 0.1 * repulsion_loss
+        loss = torch.mean(mle_loss)
 
         # Backpropagate
         self.optimizer.zero_grad()
@@ -126,16 +105,12 @@ class PathGuidingSystem:
         """
         Uses the trained network to sample a new direction.
         """
-        # Set network to evaluation mode (important for layers like dropout/batchnorm)
         self.gnn.eval()
         with torch.no_grad():
             vmf_params = self.gnn(position, wo, roughness)
             
-            # (Your clamping and distribution creation logic here)
-            
             guiding_dist = BatchedMixedSphericalGaussianDistribution(vmf_params)
             sampled_dirs = guiding_dist.sample()
-            # You would also need to return the PDF of this sample for MIS
             pdf_val = guiding_dist.pdf(sampled_dirs)
     
             return sampled_dirs, pdf_val
