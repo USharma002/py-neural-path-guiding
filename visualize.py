@@ -488,7 +488,7 @@ class MitsubaViewer(QMainWindow):
         self.integrator.set_guiding( False )
         print("Manual train step triggered.")
 
-        for i in range(2000):
+        for i in range(100):
             custom_render(self.scene, spp = 1, integrator = self.integrator, progress=False, seed=1)
             loss = self.guiding_system.train_step(self.integrator)
             if (i + 1) % 10 == 0:
