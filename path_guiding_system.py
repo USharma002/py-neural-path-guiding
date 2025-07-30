@@ -20,8 +20,8 @@ class PathGuidingSystem:
         # This function is responsible for calling scatterDataIntoBuffer
         # and converting the record fields into PyTorch tensors.
         rec = integrator.surfaceInteractionRecord
-        if rec.active.torch().shape[0] == rec.radiance_nee.torch().shape[0]:
-            integrator.scatterDataIntoBuffer()
+        integrator.scatterDataIntoBuffer()
+
         if dr.width(rec.position) == 0:
             return None, None, None, None # Return None if no data
 

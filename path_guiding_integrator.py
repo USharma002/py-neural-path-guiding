@@ -13,7 +13,7 @@ import torch
 from math_utils import *
 device = "cuda"
 
-
+epsilon = 0.00001
 def mis_weight(pdf_a, pdf_b):
     """
         Compute the Multiple Importance Sampling (MIS) weight given the densities
@@ -76,7 +76,6 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
     @dr.wrap_ad(source='drjit', target='torch')
     def sample_guided_direction(self, position, wo, normal):
         with torch.no_grad():
-
             roughness = torch.ones((position.shape[0], 1), device=device)
             wo_pred, pdf_val = self.guiding_system.sample_guided_direction(position, wo, roughness)
 
@@ -94,6 +93,10 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             self.bsdfSamplingFraction = 0.5
         else:
             self.bsdfSamplingFraction = 1.0
+
+    def set_iteration(self: mi.SamplingIntegrator, iteration: int):
+        """Sets the current rendering iteration number."""
+        self.iteration = iteration
 
     def resetRayPathData(self: mi.SamplingIntegrator):
         self.surfaceInteractionRecord = dr.zeros(SurfaceInteractionRecord, shape= self.array_size)
@@ -119,6 +122,7 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
         β = mi.Spectrum(1)        # Path throughput weight
         η = mi.Float(1)           # Index of refraction
         active = mi.Bool(active)  # Active SIMD lanes
+
         self.resetRayPathData()
 
         # index to store the data for rays
@@ -154,14 +158,14 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             # ---------------------- Direct emission ----------------------
             
             # Compute MIS weight for emitter sample from previous bounce
-            ds = mi.DirectionSample3f(scene, si=si, ref=prev_si)
-            emitter_pdf = scene.pdf_emitter_direction(prev_si, ds, ~prev_bsdf_delta)
+            ds_direct = mi.DirectionSample3f(scene, si=si, ref=prev_si)
+            emitter_pdf = scene.pdf_emitter_direction(prev_si, ds_direct, ~prev_bsdf_delta)
             mis = mis_weight(
                 prev_bsdf_pdf,
                 emitter_pdf
             )
 
-            raw_Le = ds.emitter.eval(si)
+            raw_Le = ds_direct.emitter.eval(si)
 
             # Le = β * raw_Le
             Le = β * mis * raw_Le
@@ -184,17 +188,35 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             wo = si.to_local(ds.d)
             bsdf_value_em, bsdf_pdf_em = bsdf.eval_pdf(bsdf_ctx, si, wo, active_em)
 
-            guided_pdf_em = mi.Float(0.0)
-            do_guiding_for_nee = active_em & (self.iteration > 1)
-            pdf_val = self.guiding_pdf(si.p.torch(), si.to_local(-ray.d).torch(), si.n.torch(), si.to_local(ds.d.torch()).torch())
-            dr.scatter(guided_pdf_em, pdf_val, ray_index, do_guiding_for_nee)
+            # Compute PDF of getting non-delta surface (i.e. diffuse surface)
+            active_guiding_and_em = active_em & (self.iteration > 1)
 
-            surface_pdf_em = (self.bsdfSamplingFraction * bsdf_pdf_em) + ((1 - self.bsdfSamplingFraction) * guided_pdf_em)
-            
             #   store current bsdf component
             prev_bsdf_component = bsdf_ctx.component
 
-            mis_em = dr.select(ds.delta, 1.0, mis_weight(ds.pdf, surface_pdf_em))
+            #   sample direction without delta component
+            bsdf_ctx.component &= ~mi.BSDFFlags.Delta
+            bsdf_sample_non_delta, bsdf_weight_non_delta = bsdf.sample( bsdf_ctx, si, mi.Float( 0.5 ), mi.Vector2f(0.5, 0.5), active_guiding_and_em )
+
+            pdf_without_delta = bsdf.pdf( bsdf_ctx, si, bsdf_sample_non_delta.wo, active_guiding_and_em ) 
+
+            #   pdf(wo | delta)
+            #       set back to previous state which should have non-delta
+            bsdf_ctx.component = prev_bsdf_component
+            pdf_with_delta = bsdf.pdf( bsdf_ctx, si, bsdf_sample_non_delta.wo, active_guiding_and_em ) 
+
+            #   pdf of getting a diffuse surface
+            pdf_diffuse = (pdf_with_delta + epsilon) / (pdf_without_delta + epsilon)            
+
+            guided_pdf_em = self.guiding_pdf(si.p.torch(), si.to_local(-ray.d).torch(), si.n.torch(), si.to_local(ds.d.torch()).torch())
+
+            surface_pdf_em = (self.bsdfSamplingFraction * bsdf_pdf_em) + ((1 - self.bsdfSamplingFraction) * guided_pdf_em)
+
+            surface_pdf_em = dr.select( (self.iteration <= 1), bsdf_pdf_em, surface_pdf_em )
+
+            #   MIS weight with pdf(wo | emission sampling)
+            mis_em = dr.select( ds.delta, 1.0, mis_weight(ds.pdf, surface_pdf_em) )
+
             Lr_dir = β * mis_em * bsdf_value_em * em_weight
             
             # Lr_dir = mi.Spectrum(0.)
@@ -241,9 +263,9 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             active_sample_bsdf_without_mis &= active_next
 
             # IF sampling with Guiding technique MIS
-            guiding_dir, guiding_pdf = self.sample_guided_direction(si.p.torch(), si.to_local(-ray.d).torch(), si.n.torch())
-            wo_world[active_sample_guiding_mis] = guiding_dir
-            wo_local[active_sample_guiding_mis] = si.to_local(guiding_dir)
+            guided_dir, guided_pdf = self.sample_guided_direction(si.p.torch(), si.to_local(-ray.d).torch(), si.n.torch())
+            wo_world[active_sample_guiding_mis] = guided_dir
+            wo_local[active_sample_guiding_mis] = si.to_local(guided_dir)
             bsdf_value[active_sample_guiding_mis], bsdf_pdf[active_sample_guiding_mis] = bsdf.eval_pdf(bsdf_ctx, si, wo_local, active_sample_guiding_mis)
 
             # If we instead sampled from the BSDF, we still need to know Guiding PDF for MIS
@@ -251,16 +273,20 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
                 si.p.torch(), si.to_local(-ray.d).torch(), si.n.torch(), wo_local.torch()
             )
 
-            dr.scatter(guiding_pdf, guided_pdf_for_bsdf_sample, ray_index, active_sample_bsdf_mis)
+            # dr.scatter(guided_pdf, guided_pdf_for_bsdf_sample, ray_index, active_sample_bsdf_mis)
+            combined_guided_pdf = dr.select(
+                active_sample_bsdf_mis, # The condition mask
+                guided_pdf_for_bsdf_sample,   # Value if true
+                guided_pdf # Value if false
+            )
 
             # Finally, compute pdf and BSDF weight
-            woPdf[active_next & do_guiding_bsdf_mis] = (self.bsdfSamplingFraction * bsdf_pdf) + (1 - self.bsdfSamplingFraction) * guiding_pdf
+            woPdf[active_next & do_guiding_bsdf_mis] = (self.bsdfSamplingFraction * bsdf_pdf) + (1 - self.bsdfSamplingFraction) * combined_guided_pdf
             bsdf_weight[active_next & do_guiding_bsdf_mis] = bsdf_value / woPdf
 
             # ---- Update loop variables based on current interaction -----
 
             globalIndex = (ray_index * self.max_depth) + depth
-
             storeFlag = active & si.is_valid()
 
             dr.scatter(self.surfaceInteractionRecord.position, value= si.p, index= globalIndex, active= storeFlag)

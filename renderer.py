@@ -11,7 +11,7 @@ import random
 device = "cuda"
 
 mi.set_variant("cuda_ad_rgb")
-# dr.set_log_level(dr.LogLevel.Warn)
+dr.set_log_level(dr.LogLevel.Warn)
 
 class Renderer:
 	def __init__(self):
@@ -31,7 +31,7 @@ class Renderer:
 		valid_radiance = dr.select(valid, radiance, 0.0)
 		return valid_radiance
 
-	def render(self, scene, sensor = None, spp = None, integrator = None, progress=True, seed = 0):
+	def render(self, scene, sensor = None, spp = None, integrator = None, progress=True, seed = 0, progress_setter=None, guiding=False):
 		self.sensor = scene.sensors()[0] if sensor is None else sensor
 		self.film = self.sensor.film()
 		self.sampler = self.sensor.sampler()
@@ -49,19 +49,27 @@ class Renderer:
 		accumulated_radiance = 0
 		pbar = tqdm(range(spp), f"Rendering ({spp} spp)", leave=False) if progress else range(spp)
 		
-		# dr.set_flag(dr.JitFlag.LoopRecord, False)
-		# dr.set_flag(dr.JitFlag.VCallRecord, False)
+		if guiding:
+			dr.set_flag(dr.JitFlag.LoopRecord, False)
+			dr.set_flag(dr.JitFlag.VCallRecord, False)
 		
 		for i in pbar:
+			if progress_setter:
+				progress_setter( i * 100 // spp )
+			
+			if guiding:
+				integrator.set_iteration(i + 1)
+			else:
+				integrator.set_iteration( 0 )
+
 			self.sampler.seed(i + random.randint(0, 2**32) * seed, self.num_rays)
 			frame = self.render_frame(scene, integrator)
-			accumulated_radiance += frame.torch()
+			accumulated_radiance += frame.torch()			
 
-		# dr.set_flag(dr.JitFlag.LoopRecord, True)
-		# dr.set_flag(dr.JitFlag.VCallRecord, True)
-
+		dr.set_flag(dr.JitFlag.LoopRecord, True)
+		dr.set_flag(dr.JitFlag.VCallRecord, True)
 		# Now, this part will be fast because the computation graph is small and efficient.
-		final_image = accumulated_radiance / spp
+		final_image = accumulated_radiance / spp if spp > 0 else accumulated_radiance
 		final_image_reshaped = final_image.reshape((self.res_y, self.res_x, 3))
 		return final_image_reshaped.cpu().detach()
 

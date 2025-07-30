@@ -13,6 +13,9 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from PyQt6.QtGui import QPixmap, QImage, QMouseEvent, QColor
 from PyQt6.QtCore import Qt, QPointF, QPoint
+from PyQt6.QtWidgets import QProgressBar
+from PyQt6.QtWidgets import QTextEdit
+from PyQt6.QtCore import QRunnable, QThreadPool, pyqtSignal, QObject
 import matplotlib.cm as cm
 
 from path_guiding_integrator import PathGuidingIntegrator
@@ -36,6 +39,53 @@ mi.set_variant('cuda_ad_rgb')
 
 # dr.set_flag(dr.JitFlag.LoopRecord, False)
 # dr.set_flag(dr.JitFlag.VCallRecord, False)
+
+class WorkerSignals(QObject):
+    finished = pyqtSignal(object)
+    progress = pyqtSignal(int)
+    log = pyqtSignal(str)
+
+class RenderWorker(QRunnable):
+    def __init__(self, render_func, *args, **kwargs):
+        super().__init__()
+        self.render_func = render_func
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+    def run(self):
+        self.signals.progress.emit(0)
+        result = self.render_func(*self.args, **self.kwargs)
+        self.signals.progress.emit(100)
+        self.signals.finished.emit(result)
+
+
+class TrainingWorker(QRunnable):
+    def __init__(self, scene, integrator, guiding_system, is_guiding_enabled, steps=100):
+        super().__init__()
+        self.scene = scene
+        self.integrator = integrator
+        self.guiding_system = guiding_system
+        self.is_guiding_enabled = is_guiding_enabled
+        self.steps = steps
+        self.signals = WorkerSignals()
+
+    def run(self):
+        mi.set_variant("cuda_ad_rgb")
+        self.integrator.set_guiding(False)
+        print("Manual train step triggered.")
+
+        for i in range(self.steps):
+            custom_render(self.scene, spp=1, integrator=self.integrator, progress=False, seed=1)
+            loss = self.guiding_system.train_step(self.integrator)
+            if (i + 1) % 10 == 0:
+                msg = f"Step {i+1}/{self.steps}, Loss: {loss:.6f}"
+                print(msg)  # Still prints to terminal
+                self.signals.log.emit(msg)
+            self.signals.progress.emit(int((i + 1) / self.steps * 100))
+
+        self.integrator.set_guiding(self.is_guiding_enabled)
+        self.signals.finished.emit(None)
 
 import plotly.graph_objects as go
 
@@ -198,6 +248,7 @@ class MitsubaViewer(QMainWindow):
         super().__init__()
         self.setWindowTitle("Mitsuba Click-Based Viewer")
 
+        self.thread_pool = QThreadPool()
         self.main_resolution = (256, 256)
         self.last_click_coords = None
 
@@ -254,6 +305,37 @@ class MitsubaViewer(QMainWindow):
         self.vmf_view.setMinimumSize(256, 256)
         self.vmf_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+
+
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setVisible(False)
+
+        # --- INPUT BOXES FOR PARAMETERS ---
+        self.param_layout = QHBoxLayout()
+
+        self.spp_input = QTextEdit()
+        self.spp_input.setFixedHeight(30)
+        self.spp_input.setPlaceholderText("SPP (e.g. 16)")
+        self.spp_input.setText("16")
+        self.param_layout.addWidget(self.spp_input)
+
+        self.steps_input = QTextEdit()
+        self.steps_input.setFixedHeight(30)
+        self.steps_input.setPlaceholderText("Training Steps (e.g. 100)")
+        self.steps_input.setText("100")
+        self.param_layout.addWidget(self.steps_input)
+
+        self.main_layout.addLayout(self.param_layout)
+
+
+        self.main_layout.addWidget(self.log_output)
+        self.main_layout.addWidget(self.progress_bar)
         self.layout.addWidget(self.main_view, stretch=1)
         self.layout.addWidget(self.hover_view, stretch=0)
         self.layout.addWidget(self.normalized_pdf_view, stretch=0)
@@ -280,21 +362,45 @@ class MitsubaViewer(QMainWindow):
             return
 
         self.is_rendering = True
-        try:
-            self.integrator.set_guiding( self.guiding_checkbox.isChecked() )
-            print(f"Re-rendering main image with path guiding: {self.guiding_checkbox.isChecked()}")
-            image_np = custom_render(self.scene, spp=64, integrator=self.integrator, seed=0).numpy()
+        # Show loading status on checkbox
+        original_text = self.guiding_checkbox.text()
+        self.guiding_checkbox.setText("⏳ Loading...")
+        self.guiding_checkbox.setEnabled(False)
+        QApplication.processEvents()
 
-            self.original_main_image_np = image_np 
+        def render_task():
+            mi.set_variant("cuda_ad_rgb")
+            spp = int(self.spp_input.toPlainText()) if self.spp_input.toPlainText().isdigit() else 16
+            self.integrator.set_guiding(self.guiding_checkbox.isChecked())
+
+            use_guiding = self.guiding_checkbox.isChecked()
+            self.integrator.set_guiding( use_guiding )
+            return custom_render(self.scene, spp=spp, integrator=self.integrator, seed=0, guiding = use_guiding, progress_setter=on_render_progress).numpy()
+
+        def on_render_progress(value):
+            self.progress_bar.setValue(value)
+            self.progress_bar.setVisible(True)
+
+        def on_render_complete(image_np):
+            self.original_main_image_np = image_np
             if self.last_click_coords:
                 x, y = self.last_click_coords
                 image_np = draw_marker_on_image(image_np, x, y)
 
             pixmap = numpy_to_qpixmap(image_np ** (1/2.2))
             self.main_view.setPixmap(pixmap)
-
-        finally:
             self.is_rendering = False
+
+            self.guiding_checkbox.setText(original_text)
+            self.guiding_checkbox.setEnabled(True)
+            self.is_rendering = False
+            self.progress_bar.setVisible(False)
+
+        worker = RenderWorker(render_task)
+        worker.signals.finished.connect(on_render_complete)
+        worker.signals.progress.connect(on_render_progress)
+        self.thread_pool.start(worker)
+
 
 
     def load_default_scene(self):
@@ -357,14 +463,20 @@ class MitsubaViewer(QMainWindow):
             sensor_params.update()
 
             self.integrator = mi.load_dict({
-                'type': 'path_guiding_integrator'
+                "type": "path_guiding_integrator",
+                "max_depth": 5
             })
+            
             num_rays = self.main_resolution[0] * self.main_resolution[1]
             self.integrator.setup(
                 num_rays=num_rays,
                 bbox_min=self.scene.bbox().min,
                 bbox_max=self.scene.bbox().max
             )
+
+            sensor_params = mi.traverse(self.main_sensor)
+            sensor_params["film.size"] = self.main_resolution
+            sensor_params.update()
 
             self.original_main_image_np = custom_render(self.scene, spp=16, integrator=self.integrator).numpy()
             pixmap = numpy_to_qpixmap(self.original_main_image_np ** (1/2.2))
@@ -484,18 +596,51 @@ class MitsubaViewer(QMainWindow):
 
         self.on_mouse_click(fake_event)
 
+    # def train_step_clicked(self):
+    #     self.integrator.set_guiding( False )
+    #     print("Manual train step triggered.")
+
+    #     for i in range(100):
+    #         custom_render(self.scene, spp = 1, integrator = self.integrator, progress=False, seed=1)
+    #         loss = self.guiding_system.train_step(self.integrator)
+    #         if (i + 1) % 10 == 0:
+    #             print(f"Loss : {loss}")
+
+    #     self.integrator.set_guiding( self.guiding_checkbox.isChecked() )
+    #     self.reprocess_last_click()
+
     def train_step_clicked(self):
-        self.integrator.set_guiding( False )
-        print("Manual train step triggered.")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.log_output.clear()
+        self.log_output.setVisible(True)
+        self.train_button.setEnabled(False)
 
-        for i in range(100):
-            custom_render(self.scene, spp = 1, integrator = self.integrator, progress=False, seed=1)
-            loss = self.guiding_system.train_step(self.integrator)
-            if (i + 1) % 10 == 0:
-                print(f"Loss : {loss}")
+        def on_progress(value):
+            self.progress_bar.setValue(value)
 
-        self.integrator.set_guiding( self.guiding_checkbox.isChecked() )
-        self.reprocess_last_click()
+        def on_log(message):
+            self.log_output.append(message)
+
+        def on_finished(_):
+            self.progress_bar.setVisible(False)
+            self.log_output.setVisible(False)
+            self.train_button.setEnabled(True)
+            self.reprocess_last_click()
+
+        steps = int(self.steps_input.toPlainText()) if self.steps_input.toPlainText().isdigit() else 100
+        worker = TrainingWorker(
+            scene=self.scene,
+            integrator=self.integrator,
+            guiding_system=self.guiding_system,
+            is_guiding_enabled=self.guiding_checkbox.isChecked(),
+            steps=steps
+        )
+        worker.signals.progress.connect(on_progress)
+        worker.signals.log.connect(on_log)
+        worker.signals.finished.connect(on_finished)
+        self.thread_pool.start(worker)
+
 
 
 if __name__ == '__main__':
