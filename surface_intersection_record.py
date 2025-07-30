@@ -5,7 +5,8 @@ class SurfaceInteractionRecord:
     """ Custom data struct to hold the recordings together """
     DRJIT_STRUCT = {
         'position' : mi.Vector3f, # normalized to [-1, 1]^3?
-        'direction' : mi.Vector3f, # [theta, phi] wi, where theta in [0, pi] and phi in [0, 2pi]
+        'wi' : mi.Vector3f, # [theta, phi] wi, where theta in [0, pi] and phi in [0, 2pi]
+        'wo' : mi.Vector3f, # [theta, phi] wi, where theta in [0, pi] and phi in [0, 2pi]
     
         # Storation needed for calculation
         'bsdf' : mi.Color3f, # [optional] for learning 5-D product distribution L_i * f_r
@@ -34,7 +35,8 @@ class SurfaceInteractionRecord:
 
     def __init__(self) -> None:
         self.position = mi.Vector3f()
-        self.direction = mi.Vector3f()
+        self.wo = mi.Vector3f()
+        self.wi = mi.Vector3f()
         self.normal = mi.Vector3f()
 
         self.emittedRadiance = mi.Spectrum() # Le

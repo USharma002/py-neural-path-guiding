@@ -7,10 +7,11 @@ import torch
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QWidget, QHBoxLayout,
-    QVBoxLayout, QPushButton, QFileDialog, QCheckBox  
+    QVBoxLayout, QPushButton, QFileDialog, QCheckBox 
 )
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 
-from PyQt6.QtGui import QPixmap, QImage, QMouseEvent
+from PyQt6.QtGui import QPixmap, QImage, QMouseEvent, QColor
 from PyQt6.QtCore import Qt, QPointF, QPoint
 import matplotlib.cm as cm
 
@@ -18,6 +19,7 @@ from path_guiding_integrator import PathGuidingIntegrator
 from path_guiding_system import PathGuidingSystem
 from vmf_mixture import *
 
+import random 
 import io, time
 from PIL import Image
 
@@ -30,10 +32,94 @@ custom_render = Renderer().render
 
 # Set Mitsuba variant
 mi.set_variant('cuda_ad_rgb')
-mi.set_log_level(mi.LogLevel.Warn)
+# mi.set_log_level(mi.LogLevel.Warn)
 
-dr.set_flag(dr.JitFlag.LoopRecord, False)
-dr.set_flag(dr.JitFlag.VCallRecord, False)
+# dr.set_flag(dr.JitFlag.LoopRecord, False)
+# dr.set_flag(dr.JitFlag.VCallRecord, False)
+
+import plotly.graph_objects as go
+
+def add_rgb_axes_to_fig(fig, length=1.1, cone_size=0.07):
+    """Adds colored RGB arrows to a Plotly 3D figure to represent the axes."""
+    axis_names = ['X', 'Y', 'Z']
+    colors = ['red', 'lime', 'blue']
+    directions = [[1, 0, 0], [0, 1, 0], [0, 0, 1]] # For cone direction
+
+    for i in range(3):
+        # Calculate the end point of the axis arrow
+        x_end, y_end, z_end = [d * length for d in directions[i]]
+        
+        # Axis Line: Provide x, y, and z as separate lists of [start, end]
+        fig.add_trace(go.Scatter3d(x=[0, x_end], y=[0, y_end], z=[0, z_end],
+                                     mode='lines',
+                                     line=dict(color=colors[i], width=5),
+                                     name=axis_names[i]))
+        # Arrow Head (Cone)
+        fig.add_trace(go.Cone(x=[x_end], y=[y_end], z=[z_end],
+                               u=[directions[i][0]], v=[directions[i][1]], w=[directions[i][2]],
+                               colorscale=[[0, colors[i]], [1, colors[i]]],
+                               sizemode="absolute", sizeref=cone_size,
+                               showscale=False))
+    return fig
+
+
+def visualize_vmf_on_sphere_html(model, res=100):
+    xyz, xgrid, ygrid, zgrid = generate_sphere_mesh(res)
+
+    with torch.no_grad():
+        pdf_vals = model.pdf(xyz)
+        pdf_vals = pdf_vals.reshape(res, res)
+
+    x = xgrid.cpu().numpy()
+    y = ygrid.cpu().numpy()
+    z = zgrid.cpu().numpy()
+    pdf = pdf_vals.detach().cpu().numpy()
+
+    
+    fig = go.Figure(data=go.Surface(
+        x=x, y=y, z=z,
+        surfacecolor=pdf,
+        colorscale='plasma',
+        cmin=pdf.min(), cmax=pdf.max(),
+        showscale=False,
+        opacity=1.0
+    ))
+    fig = add_rgb_axes_to_fig(fig)
+
+    fig.update_layout(
+        title='vMF Mixture on Unit Sphere',
+        scene=dict(
+            xaxis=dict(visible=False,),
+            yaxis=dict(visible=False,),
+            zaxis=dict(visible=False,),
+            bgcolor='black'
+        ),
+        scene_camera=dict(
+            up=dict(x=0, y=0, z=1),
+            center=dict(x=0, y=0, z=0),
+            eye=dict(x=1.25, y=1.25, z=1.25)
+        ),
+        paper_bgcolor='black',
+        plot_bgcolor='black',
+        font=dict(color="white"),
+        margin=dict(l=0, r=0, t=30, b=0),
+    )
+
+    return fig.to_html(include_plotlyjs='cdn')
+
+
+def generate_sphere_mesh(res=100):
+    theta = torch.linspace(0, 2 * np.pi, res)    
+    phi = torch.linspace(0, np.pi, res) 
+    theta, phi = torch.meshgrid(theta, phi, indexing='ij')
+
+    x = torch.sin(phi) * torch.cos(theta)
+    y = torch.sin(phi) * torch.sin(theta)
+    z = torch.cos(phi)
+
+    xyz = torch.stack([x, y, z], dim=-1) 
+    return xyz.reshape(-1, 3), x, y, z
+
 
 device = "cuda"
 
@@ -46,31 +132,26 @@ def spherical_to_cartesian_torch(theta, phi):
     return torch.stack([x, y, z], dim=-1)
 
 def plot_non_batched_mixture(vmf, si, resolution=(256, 256), device='cuda'):
-    width, height = resolution
-    
-    # 1. Create a high-resolution grid in WORLD space using PyTorch.
-    u_coords = torch.linspace(0, 1, width, device=device)
-    v_coords = torch.linspace(0, 1, height, device=device)
-    vv, uu = torch.meshgrid(v_coords, u_coords, indexing='ij')
+    width, height = 256, 256
+    i = dr.linspace(mi.Float, 0, width - 1, width)
+    j = dr.linspace(mi.Float, 0, height - 1, height)
 
-    phi = uu.ravel() * 2 * math.pi
-    theta = torch.acos(1 - 2 * vv.ravel())
+    ii, jj = dr.meshgrid(i, j)
+    film_size = mi.Vector2f(width, height)
+    position_sample = (mi.Vector2f(ii, jj) + 0.5) / film_size
 
-    dirs_world = spherical_to_cartesian_torch(theta, phi)
+    film_size = mi.Vector2f([256, 256])
+    half_pixel_offset = 0.5 / film_size
+    corrected_position_sample = position_sample - half_pixel_offset
 
-    n = si.n.torch().to(device)
-    s = si.sh_frame.s.torch().to(device)
-    t = si.sh_frame.t.torch().to(device)
+    d = mi.warp.square_to_uniform_sphere(corrected_position_sample)
+    d = dr.normalize(d)
 
-    local_x = torch.sum(dirs_world * s, dim=-1)
-    local_y = torch.sum(dirs_world * t, dim=-1)
-    local_z = torch.sum(dirs_world * n, dim=-1)
-    
-    dirs_local = torch.stack([local_x, local_y, local_z], dim=-1)
+    dirs_local = si.to_local(d)
 
     pdf_values = vmf.pdf(dirs_local)
     
-    value_grid = pdf_values.reshape(height, width).detach().cpu().numpy()
+    value_grid = torch.log1p(pdf_values.reshape(height, width).detach().cpu()).numpy()
     
     max_val = np.max(value_grid)
     if max_val > 1e-6:
@@ -178,6 +259,11 @@ class MitsubaViewer(QMainWindow):
         self.layout.addWidget(self.normalized_pdf_view, stretch=0)
         self.layout.addWidget(self.vmf_view, stretch=0)
 
+        self.vmf_sphere_view = QWebEngineView()
+        self.vmf_sphere_view.setMinimumSize(256, 256)
+        self.vmf_sphere_view.page().setBackgroundColor(QColor("black"))
+        self.layout.addWidget(self.vmf_sphere_view, stretch=1)
+
         self.main_view.mousePressEvent = self.on_mouse_click
         self.is_rendering = False
 
@@ -197,9 +283,9 @@ class MitsubaViewer(QMainWindow):
         try:
             self.integrator.set_guiding( self.guiding_checkbox.isChecked() )
             print(f"Re-rendering main image with path guiding: {self.guiding_checkbox.isChecked()}")
-            image_np = custom_render(self.scene, spp=16, integrator=self.integrator).numpy()
+            image_np = custom_render(self.scene, spp=64, integrator=self.integrator, seed=0).numpy()
 
-            self.original_main_image_np = image_np  # Update base image for marker drawing
+            self.original_main_image_np = image_np 
             if self.last_click_coords:
                 x, y = self.last_click_coords
                 image_np = draw_marker_on_image(image_np, x, y)
@@ -209,7 +295,6 @@ class MitsubaViewer(QMainWindow):
 
         finally:
             self.is_rendering = False
-
 
 
     def load_default_scene(self):
@@ -245,8 +330,7 @@ class MitsubaViewer(QMainWindow):
         sensor_params["film.size"] = self.main_resolution
         sensor_params.update()
 
-        # This call will now be fast and stable, even with high SPP
-        self.original_main_image_np = custom_render(self.scene, spp=16, integrator=self.integrator).numpy()
+        self.original_main_image_np = custom_render(self.scene, spp=16, integrator=self.integrator, seed=0).numpy()
 
         self.hover_sensor = mi.load_dict({
             'type': 'gt_spherical_camera',
@@ -315,33 +399,35 @@ class MitsubaViewer(QMainWindow):
 
         position = si.p.torch()
         normal = si.n.torch()
-        wo = ray.d.torch()
+        wo = -ray.d.torch()
         roughness = torch.tensor([[1]], device=device)
 
         self.guiding_system = self.integrator.guiding_system
         vmf_params = self.guiding_system.gnn(position, wo, roughness)
         guiding_dist = MixedSphericalGaussianDistribution(vmf_params, batch_idx=0)
 
-        n_torch = si.n.torch().to(device)
-        s_torch = si.sh_frame.s.torch().to(device)
-        t_torch = si.sh_frame.t.torch().to(device)
-
         vmf_img_np = plot_non_batched_mixture(guiding_dist, si, device=device)
-        hover_image_np = np.transpose(vmf_img_np, (1, 0, 2))  
+        vmf_img_np = np.transpose(vmf_img_np, (1, 0, 2)) 
 
         self.vmf_view.setPixmap(numpy_to_qpixmap(vmf_img_np))
 
+        # vMF Sphere visualization
+        # vmf_sphere_np = visualize_vmf_on_sphere_image(guiding_dist, res=100)
+        # self.vmf_sphere_view.setPixmap(numpy_to_qpixmap(vmf_sphere_np)) 
+        html = visualize_vmf_on_sphere_html(guiding_dist, res=100)
+        self.vmf_sphere_view.setHtml(html)
+        
         image_with_marker_np = draw_marker_on_image(self.original_main_image_np, x, y)
         self.main_view.setPixmap(numpy_to_qpixmap(image_with_marker_np ** (1/2.2)))
 
         if not dr.any(si.is_valid()):
             self.hover_view.setText("Miss (No surface hit)")
-            self.normalized_pdf_view.setText("") # Clear the third view too
+            self.normalized_pdf_view.setText("")
             return
 
         try:
             self.is_rendering = True
-            # Update UI to show "Rendering..." message in both secondary views
+            
             self.hover_view.setText("Rendering...")
             self.normalized_pdf_view.setText("Rendering...")
             QApplication.processEvents()
@@ -355,8 +441,8 @@ class MitsubaViewer(QMainWindow):
             self.hover_sensor.product_cosine = self.cosine_checkbox.isChecked()
 
             spp = 128
-            hover_image_np = mi.render(self.scene, sensor=self.hover_sensor, spp=spp).numpy()
-            hover_image_np = np.transpose(hover_image_np, (1, 0, 2))  
+            gt_image_untransposed_np = mi.render(self.scene, sensor=self.hover_sensor, spp=spp).numpy()
+            hover_image_np = np.transpose(gt_image_untransposed_np, (1, 0, 2))  
 
             # --- VISUALIZATION FOR VIRIDIS VIEW (Block 2) ---
             luminance = np.mean(hover_image_np, axis=2)
@@ -364,8 +450,8 @@ class MitsubaViewer(QMainWindow):
 
             visualization_scale = 10.0
             scaled_luminance = log_luminance * visualization_scale
+
             # normalized_luminance = np.clip(scaled_luminance, 0, 1)
-            
             colored_rgba = cm.viridis(scaled_luminance)
             colored_rgb = colored_rgba[..., :3]
 
@@ -402,8 +488,8 @@ class MitsubaViewer(QMainWindow):
         self.integrator.set_guiding( False )
         print("Manual train step triggered.")
 
-        for i in range(100):
-            custom_render(self.scene, spp = 1, integrator = self.integrator, progress=False)
+        for i in range(2000):
+            custom_render(self.scene, spp = 1, integrator = self.integrator, progress=False, seed=1)
             loss = self.guiding_system.train_step(self.integrator)
             if (i + 1) % 10 == 0:
                 print(f"Loss : {loss}")

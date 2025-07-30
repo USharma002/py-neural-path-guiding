@@ -83,10 +83,10 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             return mi.Vector3f( wo_pred ), mi.Float( pdf_val )
 
     @dr.wrap_ad(source='drjit', target='torch')
-    def guiding_pdf(self, position, wo, normal):
+    def guiding_pdf(self, position, wo, normal, wi):
         with torch.no_grad():
             roughness = torch.ones((position.shape[0], 1), device=device)
-            pdf_val = self.guiding_system.pdf(position, wo, roughness)
+            pdf_val = self.guiding_system.pdf(position, wo, roughness, wi)
             return mi.Float( pdf_val )
 
     def set_guiding(self, guiding_active: bool):
@@ -186,7 +186,7 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
 
             guided_pdf_em = mi.Float(0.0)
             do_guiding_for_nee = active_em & (self.iteration > 1)
-            pdf_val = self.guiding_pdf(si.p.torch(), ds.d.torch(), si.n.torch())
+            pdf_val = self.guiding_pdf(si.p.torch(), si.to_local(-ray.d).torch(), si.n.torch(), si.to_local(ds.d.torch()).torch())
             dr.scatter(guided_pdf_em, pdf_val, ray_index, do_guiding_for_nee)
 
             surface_pdf_em = (self.bsdfSamplingFraction * bsdf_pdf_em) + ((1 - self.bsdfSamplingFraction) * guided_pdf_em)
@@ -241,14 +241,14 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             active_sample_bsdf_without_mis &= active_next
 
             # IF sampling with Guiding technique MIS
-            guiding_dir, guiding_pdf = self.sample_guided_direction(si.p.torch(), wo_world.torch(), si.n.torch())
+            guiding_dir, guiding_pdf = self.sample_guided_direction(si.p.torch(), si.to_local(-ray.d).torch(), si.n.torch())
             wo_world[active_sample_guiding_mis] = guiding_dir
             wo_local[active_sample_guiding_mis] = si.to_local(guiding_dir)
             bsdf_value[active_sample_guiding_mis], bsdf_pdf[active_sample_guiding_mis] = bsdf.eval_pdf(bsdf_ctx, si, wo_local, active_sample_guiding_mis)
 
             # If we instead sampled from the BSDF, we still need to know Guiding PDF for MIS
             guided_pdf_for_bsdf_sample = self.guiding_pdf(
-                si.p.torch(), wo_world.torch(), si.n.torch()
+                si.p.torch(), si.to_local(-ray.d).torch(), si.n.torch(), wo_local.torch()
             )
 
             dr.scatter(guiding_pdf, guided_pdf_for_bsdf_sample, ray_index, active_sample_bsdf_mis)
@@ -264,7 +264,9 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             storeFlag = active & si.is_valid()
 
             dr.scatter(self.surfaceInteractionRecord.position, value= si.p, index= globalIndex, active= storeFlag)
-            dr.scatter(self.surfaceInteractionRecord.direction, value= wo_world, index= globalIndex, active= storeFlag)
+            dr.scatter(self.surfaceInteractionRecord.wi, value= si.to_local(-ray.d), index= globalIndex, active= storeFlag)
+            dr.scatter(self.surfaceInteractionRecord.wo, value= si.to_local(wo_world), index= globalIndex, active= storeFlag)
+
             dr.scatter(self.surfaceInteractionRecord.normal, value= si.n, index= globalIndex, active= storeFlag)
             dr.scatter(self.surfaceInteractionRecord.active, value= storeFlag, index= globalIndex, active= storeFlag)
 
@@ -394,7 +396,8 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             
         self.surfaceInteractionRecord.position = dr.gather( type(self.surfaceInteractionRecord.position), self.surfaceInteractionRecord.position, activeIndex )
         
-        self.surfaceInteractionRecord.direction = dr.gather( type(self.surfaceInteractionRecord.direction), self.surfaceInteractionRecord.direction, activeIndex )
+        self.surfaceInteractionRecord.wo = dr.gather( type(self.surfaceInteractionRecord.wo), self.surfaceInteractionRecord.wo, activeIndex )
+        self.surfaceInteractionRecord.wi = dr.gather( type(self.surfaceInteractionRecord.wi), self.surfaceInteractionRecord.wi, activeIndex )
         self.surfaceInteractionRecord.radiance = dr.gather( type(self.surfaceInteractionRecord.radiance), self.surfaceInteractionRecord.radiance, activeIndex )
 
         if self.isStoreNEERadiance:

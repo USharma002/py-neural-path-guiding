@@ -86,6 +86,7 @@ class GuidingNetwork(nn.Module):
 
         # 1. Lambda & Kappa: Use softplus for positive values
         lambda_ = F.softplus(raw_log_lambda) + 1e-5
+        # lambda_ = F.softmax(raw_log_lambda)
         kappa = F.softplus(raw_kappa) + 1e-4
 
         # 2. Theta & Phi: Use sigmoid to map to (0,1), then scale to the correct range.

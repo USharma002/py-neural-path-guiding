@@ -7,7 +7,7 @@ import drjit as dr
 from math_utils import *
 
 class PathGuidingSystem:
-    def __init__(self, device: str = "cuda", K: int = 20, learning_rate: float = 2e-5):
+    def __init__(self, device: str = "cuda", K: int = 10, learning_rate: float = 2e-5):
         self.device = device
         self.gnn = GuidingNetwork(device, K=K).to(device)
         self.optimizer = torch.optim.Adam(self.gnn.model.parameters(), lr=learning_rate)
@@ -19,20 +19,22 @@ class PathGuidingSystem:
         """
         # This function is responsible for calling scatterDataIntoBuffer
         # and converting the record fields into PyTorch tensors.
-        integrator.scatterDataIntoBuffer()
         rec = integrator.surfaceInteractionRecord
-
+        if rec.active.torch().shape[0] == rec.radiance_nee.torch().shape[0]:
+            integrator.scatterDataIntoBuffer()
         if dr.width(rec.position) == 0:
             return None, None, None, None # Return None if no data
 
         pos = rec.position.torch()
-        wo = rec.direction.torch() # This is the BSDF sample direction
+
+        wi = rec.wi.torch() # This is the BSDF sample direction
+        wo = rec.wo.torch() # This is incoming ray direction
         # For now, roughness is a placeholder
         roughness = torch.ones((pos.shape[0], 1), device=self.device)
         targets_li = rec.radiance.torch() # This is the incoming radiance Li
         bsdf_pdf = rec.bsdfPdf.torch() # Get the BSDF PDF for the sampled direction
 
-        return pos, wo, roughness, targets_li, bsdf_pdf
+        return pos, wo, wi, roughness, targets_li, bsdf_pdf
 
     def train_step(self, integrator) -> float:
         """
@@ -45,7 +47,7 @@ class PathGuidingSystem:
             The calculated loss for this training step.
         """
         # Step 1: Prepare the data from the integrator
-        pos, wo, roughness, targets_li, bsdf_pdf = self.prepare_training_data(integrator)
+        pos, wo, wi, roughness, targets_li, bsdf_pdf = self.prepare_training_data(integrator)
 
         if pos is None:
             print("Warning: Skipping training step due to no valid data.")
@@ -56,9 +58,6 @@ class PathGuidingSystem:
         # Get the network's predicted distribution for all N samples
         predicted_params = self.gnn(pos, wo, roughness)
         predicted_dist = BatchedMixedSphericalGaussianDistribution(predicted_params)
-
-        # Get the ground-truth directions and importance weights
-        ground_truth_dirs = wo
         
         # Use Li as the target value
         ground_truth_radiance = targets_li.mean(axis=1)
@@ -67,7 +66,7 @@ class PathGuidingSystem:
 
 
         # Calculate the importance-weighted loss
-        prob = predicted_dist.pdf(ground_truth_dirs)
+        prob = predicted_dist.pdf(wi)
         epsilon = 1e-8
 
         importance_weight = ground_truth_radiance.detach() / (bsdf_pdf + epsilon)
@@ -92,12 +91,12 @@ class PathGuidingSystem:
              
         return loss_val
 
-    def pdf(self, position, wo, roughness):
+    def pdf(self, position, wo, roughness, wi):
         self.gnn.eval()
         with torch.no_grad():
             vmf_params = self.gnn(position, wo, roughness)
             guiding_dist = BatchedMixedSphericalGaussianDistribution(vmf_params)
-            pdf_val = guiding_dist.pdf(wo)
+            pdf_val = guiding_dist.pdf(wi)
 
         return pdf_val
 
