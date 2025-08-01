@@ -1,10 +1,7 @@
 # py-neural-path-guiding
 
-Neural Path Guiding Framework using Python
-
-An interactive Mitsuba viewer with path guiding support.
-
-A PyQt-based GUI tool for visualizing Mitsuba scene renders with click-inspection, spherical PDFs, and neural path guiding debug views.
+Neural Path Guiding Framework using Python providing flexible envronment for prototyping.
+Also includes PyQt-based GUI tool for visualizing Mitsuba scene renders with click-inspection, spherical PDFs, and neural path guiding debug views.
 
 ![App Screenshot](assets/app.png)
 
