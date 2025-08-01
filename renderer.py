@@ -48,7 +48,7 @@ class Renderer:
 
 		accumulated_radiance = 0
 		pbar = tqdm(range(spp), f"Rendering ({spp} spp)", leave=False) if progress else range(spp)
-		
+		integrator.set_iteration( 0 )
 		if guiding:
 			dr.set_flag(dr.JitFlag.LoopRecord, False)
 			dr.set_flag(dr.JitFlag.VCallRecord, False)
