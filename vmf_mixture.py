@@ -182,17 +182,47 @@ class BatchedMixedSphericalGaussianDistribution(nn.Module):
         
         self.weights = self.lambdas / self.totalWeight.unsqueeze(1)
 
+
     def _get_lobe_pdfs(self, wi):
+        # --- No changes needed here ---
         B, _ = wi.shape
-        
         mus = spherical_to_cartesian(self.thetas, self.phis)
-        
         dot_products = torch.sum(mus * wi.unsqueeze(1), dim=2)
+
+        # ======================================================================
+        #  ROBUST NORMALIZATION CALCULATION
+        # ======================================================================
+
+        # 1. Identify where kappa is too small to be stable.
+        #    Use a slightly larger threshold for safety.
+        is_small_kappa = self.kappas < 1e-5
         
-        C_kappa = self.kappas / (2 * math.pi * (1 - torch.exp(-2 * self.kappas)))
-        C_kappa = torch.where(self.kappas < 1e-5, 1.0 / (4 * math.pi), C_kappa)
+        # 2. For the stable kappas, calculate the normalization constant.
+        #    We use a "safe" version of kappa for the calculation to avoid issues,
+        #    but the original kappa for the mask.
+        safe_kappas = torch.clamp(self.kappas, min=1e-6)
+        denominator = 2 * math.pi * (1 - torch.exp(-2 * safe_kappas))
         
-        lobe_pdfs = C_kappa * torch.exp(self.kappas * (dot_products - 1))
+        # Avoid division by zero by setting the denominator to 1 where kappa is small.
+        # The result of this division will be ignored for these elements anyway.
+        denominator[is_small_kappa] = 1.0
+        
+        # Now this division is always safe.
+        C_kappa = safe_kappas / denominator
+
+        # 3. For the small kappas, the PDF should be that of a uniform distribution.
+        #    Use torch.where to select the correct normalization constant.
+        #    Since the division was made safe, this will no longer receive a NaN.
+        uniform_pdf_const = 1.0 / (4 * math.pi)
+        C_kappa = torch.where(is_small_kappa, uniform_pdf_const, C_kappa)
+
+        # 4. Calculate the exponential term. This part is already stable.
+        #    exp(k * (dot - 1)) = exp(k*dot) * exp(-k)
+        exp_term = torch.exp(self.kappas * (dot_products - 1))
+        
+        # 5. Final PDF. For the uniform case, where kappa is near zero, exp_term is ~1,
+        #    so the PDF correctly becomes ~1 / (4*pi).
+        lobe_pdfs = C_kappa * exp_term
         
         return lobe_pdfs
 
