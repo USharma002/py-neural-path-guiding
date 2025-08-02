@@ -20,7 +20,7 @@ class PathGuidingSystem:
         Processes the integrator's record to produce clean, validated training tensors.
         """
         rec = integrator.surfaceInteractionRecord
-        integrator.scatterDataIntoBuffer()
+        integrator.scatter_data_into_buffer()
 
         if dr.width(rec.position) == 0:
             return (None,) * 6

@@ -315,15 +315,15 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
         dr.schedule(self.surfaceInteractionRecord)
 
         Lfinal = mi.Spectrum( L )
-        self.processPathData( Lfinal )
+        self.process_incoming_radiance( Lfinal )
 
-        # self.scatterDataIntoBuffer()
+        # self.scatter_data_into_buffer()
 
         return (L, dr.neq(depth, 0), [])
 
           
       
-    def processPathData(self: mi.SamplingIntegrator, Lfinal : mi.Spectrum) -> None:
+    def process_incoming_radiance(self: mi.SamplingIntegrator, Lfinal : mi.Spectrum) -> None:
         """
         Calculate incoming radiance at each vertex by propagating radiance
         backwards from the end of each path, correctly including NEE.
@@ -360,7 +360,7 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             Lo_d = Le_d + bsdf_d * Li_d
             dr.scatter(rec.product, Lo_d, array_idx, depth_mask)
 
-    def scatterDataIntoBuffer(self: mi.SamplingIntegrator) -> None:
+    def scatter_data_into_buffer(self: mi.SamplingIntegrator) -> None:
         """
             Scatter surface interaction data into buffer.
             This also filter out invalid surface interactions before scattering.
