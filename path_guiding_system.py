@@ -22,12 +22,17 @@ class PathGuidingSystem:
         rec = integrator.surfaceInteractionRecord
         integrator.scatter_data_into_buffer()
 
+        self.bbox_max = integrator.bbox_max.torch().to("cuda")
+        self.bbox_min = integrator.bbox_min.torch().to("cuda")
+
         if dr.width(rec.position) == 0:
             return (None,) * 6
 
         pos = rec.position.torch()
         wi = rec.wi.torch() # Direction of incoming ray
         wo = rec.wo.torch() # direction sampled using bsdf
+
+        pos = (pos - self.bbox_min)/(self.bbox_max - self.bbox_min)
 
         targets_li = rec.radiance.torch()
         combined_pdf = rec.woPdf.torch()
@@ -59,15 +64,6 @@ class PathGuidingSystem:
         return pos, wo, wi, roughness, targets_li, combined_pdf
 
     def train_step(self, integrator) -> float:
-        """
-        Performs a single epoch of training on the data from the integrator.
-        
-        Args:
-            integrator: The PathGuidingIntegrator instance containing the latest path data.
-            
-        Returns:
-            The calculated loss for this training step.
-        """
         # Prepare the data from the integrator
         pos, wo, wi, roughness, targets_li, combined_pdf = self.prepare_training_data(integrator)
 
@@ -146,6 +142,7 @@ class PathGuidingSystem:
     def pdf(self, position, wi, roughness, wo):
         self.gnn.eval()
         with torch.no_grad():
+            position = (position - self.bbox_min)/(self.bbox_max - self.bbox_min)
             vmf_params = self.gnn(position, wi, roughness)
             guiding_dist = BatchedMixedSphericalGaussianDistribution(vmf_params)
             pdf_val = guiding_dist.pdf(wo)
@@ -158,6 +155,7 @@ class PathGuidingSystem:
         """
         self.gnn.eval()
         with torch.no_grad():
+            position = (position - self.bbox_min)/(self.bbox_max - self.bbox_min)
             vmf_params = self.gnn.query(position, wi, roughness)
             
             guiding_dist = BatchedMixedSphericalGaussianDistribution(vmf_params)

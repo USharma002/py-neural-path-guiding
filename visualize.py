@@ -296,6 +296,7 @@ class MitsubaViewer(QMainWindow):
             num_rays = self.MAIN_RESOLUTION[0] * self.MAIN_RESOLUTION[1]
             print(f"Setting up integrator for a wavefront of {num_rays} rays.")
             
+            print(self.scene.bbox().min, self.scene.bbox().max)
             self.integrator.setup(
                 num_rays=num_rays,
                 bbox_min=self.scene.bbox().min,
@@ -554,6 +555,13 @@ class MitsubaViewer(QMainWindow):
                     path = os.path.join("renders", filename)
                     img_pil.save(path)
                     print(f"Saved image to {path}")
+
+                    bmp = mi.Bitmap(image)
+                    exr_filename = f"{prefix}_{mode}_{res}_{timestamp}.exr"
+                    exr_path = os.path.join("renders", exr_filename)
+                    bmp.write(exr_path)
+                    print(f"Saved HDR image to {exr_path}")
+                    
                 except Exception as e:
                     print(f"Error saving '{prefix}' image: {e}")
 

@@ -5,6 +5,7 @@ from tqdm.auto import tqdm
 import time
 
 from path_guiding_integrator import PathGuidingIntegrator
+from nrc import NeuralRadianceCache
 
 mi.set_variant("cuda_ad_rgb")
 dr.set_log_level(dr.LogLevel.Warn)
@@ -123,6 +124,9 @@ if __name__ == "__main__":
 	end_time = time.time()
 	print(f"Total rendering time: {end_time - start_time:.2f} seconds.")
 
-	plt.imshow(img ** (1. / 2.2))
-	plt.axis("off")
-	plt.show()
+	nrc = integrator.nrc
+	loss = nrc.train_step(integrator)
+	
+	# plt.imshow(img ** (1. / 2.2))
+	# plt.axis("off")
+	# plt.show()

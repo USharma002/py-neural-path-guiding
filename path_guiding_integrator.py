@@ -6,6 +6,7 @@ mi.set_variant("cuda_ad_rgb")
 
 from path_guiding_system import PathGuidingSystem
 from surface_intersection_record import SurfaceInteractionRecord
+from nrc import NeuralRadianceCache
 from typing import Tuple
 
 import torch
@@ -54,6 +55,10 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
         # For variance calculation
         self.sumL = mi.Spectrum(0)
         self.sumL2 = mi.Spectrum(0)
+
+        self.nrc_system = NeuralRadianceCache(device="cuda")
+        self.nrc_query_prob = props.get('nrc_query_prob', 0.8) # 80% chance to query NRC after 1st bounce
+
         self.guiding_system = PathGuidingSystem()
         self.guiding = mi.Bool(False)
 
@@ -62,18 +67,21 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
         num_rays: int,
         bbox_min: mi.Vector3f,
         bbox_max: mi.Vector3f,
-        bsdfSamplingFraction: float = None,
+        bsdfSamplingFraction: float = 0.5,
         isStoreNEERadiance: bool = False
     ) -> None:
 
         self.num_rays = num_rays
         self.array_size = self.num_rays * self.max_depth
 
-        self.bsdfSamplingFraction = bsdfSamplingFraction if bsdfSamplingFraction is not None else self.bsdfSamplingFraction
+        self.bsdfSamplingFraction = bsdfSamplingFraction
         self.isStoreNEERadiance = isStoreNEERadiance
 
         self.bbox_min = bbox_min
         self.bbox_max = bbox_max
+
+        self.guiding_system.bbox_max = bbox_max.torch().to("cuda")
+        self.guiding_system.bbox_min = bbox_min.torch().to("cuda")
 
         self.surfaceInteractionRecord = dr.zeros(SurfaceInteractionRecord, shape= self.array_size)
 
@@ -84,6 +92,17 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             wo_pred, pdf_val = self.guiding_system.sample_guided_direction(position, wi, roughness)
 
             return mi.Vector3f( wo_pred ), mi.Float( pdf_val )
+
+    @dr.wrap_ad(source='drjit', target='torch')
+    def query_nrc(self, positions, normals, view_dirs):
+        """Wrapper to query the NRC with correct arguments."""
+        with torch.no_grad():
+            roughness = torch.ones((positions.shape[0], 1), device=device)
+            L_nrc = self.nrc_system.query(positions, normals, view_dirs, roughness).float()
+
+            return mi.Spectrum( L_nrc )
+            
+
 
     @dr.wrap_ad(source='drjit', target='torch')
     def guiding_pdf(self, position, wi, normal, wo):
@@ -167,10 +186,10 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             # Compute MIS weight for emitter sample from previous bounce
             ds_direct = mi.DirectionSample3f(scene, si=si, ref=prev_si)
             emitter_pdf = scene.pdf_emitter_direction(prev_si, ds_direct, ~prev_bsdf_delta)
-            mis = mis_weight(
-                prev_bsdf_pdf,
-                emitter_pdf
-            )
+            # mis = mis_weight(
+            #     prev_bsdf_pdf,
+            #     emitter_pdf
+            # )
 
             raw_Le = ds_direct.emitter.eval(si)
 
@@ -205,6 +224,23 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             #  If we sampled a delta component, then we have a 0 probability
             #  of sampling that direction via guiding
             delta = mi.has_flag( bsdf_sample.sampled_type, mi.BSDFFlags.Delta )
+
+            # ----------------------- Neural Radiance Cache ----------------
+            # L_cache = mi.Spectrum(0)
+
+            # query_nrc_mask = (depth > 2) & si.is_valid() & ~delta & active
+            # inputs_valid_for_caching = dr.all(dr.isfinite(si.p))
+
+            # use_cache = query_nrc_mask & (sampler.next_1d() < self.nrc_query_prob) & inputs_valid_for_caching
+
+            # predicted_radiance_t = self.query_nrc(si.p.torch(), si.n.torch(), wo_world.torch())
+            # L_cache = mi.Spectrum(predicted_radiance_t)
+
+            # bsdf_val, _ = bsdf.eval_pdf(bsdf_ctx, si, wo_local, use_cache)
+
+            # L += dr.select(use_cache, β * bsdf_val * L_cache, mi.Spectrum(0.))
+
+            # active_next &= ~use_cache
 
             # ------------------ BSDF or Guiding ? --------------------------
 
@@ -255,11 +291,12 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             # ---- Update loop variables based on current interaction -----
 
             globalIndex = (ray_index * self.max_depth) + depth
-            storeFlag = active & si.is_valid()
+            storeFlag = active & si.is_valid() # don't use nrc for training data
 
             dr.scatter(self.surfaceInteractionRecord.position, value= si.p, index= globalIndex, active= storeFlag)
             dr.scatter(self.surfaceInteractionRecord.wi, value= wi_local, index= globalIndex, active= storeFlag)
             dr.scatter(self.surfaceInteractionRecord.wo, value= wo_local, index= globalIndex, active= storeFlag)
+            dr.scatter(self.surfaceInteractionRecord.wo_world, value= wo_world, index= globalIndex, active= storeFlag)
 
             dr.scatter(self.surfaceInteractionRecord.normal, value= si.n, index= globalIndex, active= storeFlag)
             dr.scatter(self.surfaceInteractionRecord.active, value= storeFlag, index= globalIndex, active= storeFlag)
@@ -390,8 +427,10 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             return
             
         self.surfaceInteractionRecord.position = dr.gather( type(self.surfaceInteractionRecord.position), self.surfaceInteractionRecord.position, activeIndex )
+        self.surfaceInteractionRecord.normal = dr.gather( type(self.surfaceInteractionRecord.normal), self.surfaceInteractionRecord.normal, activeIndex )
         
         self.surfaceInteractionRecord.wo = dr.gather( type(self.surfaceInteractionRecord.wo), self.surfaceInteractionRecord.wo, activeIndex )
+        self.surfaceInteractionRecord.wo_world = dr.gather( type(self.surfaceInteractionRecord.wo_world), self.surfaceInteractionRecord.wo_world, activeIndex )
         self.surfaceInteractionRecord.wi = dr.gather( type(self.surfaceInteractionRecord.wi), self.surfaceInteractionRecord.wi, activeIndex )
         self.surfaceInteractionRecord.radiance = dr.gather( type(self.surfaceInteractionRecord.radiance), self.surfaceInteractionRecord.radiance, activeIndex )
 
@@ -421,11 +460,11 @@ if __name__ == "__main__":
 
     print("Loading Scene")
     scene = mi.cornell_box()
-    scene['sensor']['sampler']['sample_count'] = 16
+    scene['sensor']['sampler']['sample_count'] = 1
     scene['sensor']['film']['width'] = 400
     scene['sensor']['film']['height'] = 400
 
-    num_rays = scene['sensor']['film']['width'] * scene['sensor']['film']['height'] * 16
+    num_rays = scene['sensor']['film']['width'] * scene['sensor']['film']['height'] * 1
     scene = mi.load_dict(scene)
 
     integrator.setup(
@@ -433,6 +472,12 @@ if __name__ == "__main__":
         bbox_min=scene.bbox().min,
         bbox_max=scene.bbox().max
     )
+
+    for i in range(100):
+        img = mi.render(scene, integrator=integrator)
+        integrator.scatter_data_into_buffer()
+        loss = integrator.nrc_system.train_step(integrator)
+        print(f"Loss: {loss}")
 
     print("Rendering")
     img = mi.render(scene, integrator=integrator)

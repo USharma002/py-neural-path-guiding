@@ -66,7 +66,6 @@ class GuidingNetwork(nn.Module):
             roughness = roughness.unsqueeze(1)
 
         positions = (positions + 1.0) / 2.0
-        view_dirs = (view_dirs + 1.0) / 2.0
 
         input_tensor = torch.cat([positions, view_dirs, roughness], dim=1)
         return input_tensor
