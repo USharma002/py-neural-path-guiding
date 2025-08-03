@@ -20,7 +20,7 @@ Also includes PyQt-based GUI tool for visualizing Mitsuba scene renders with cli
 
 ### Yet To Do:
 - IMPROVE SPEED (Priority)
-- ALIGN VISUALIZATIONS (Priority)
+- ~ALIGN VISUALIZATIONS (Priority)~ Done
 - Make more information available on the UI and allow more control over hyperparameters
 - Implement more guiding techniques
 
