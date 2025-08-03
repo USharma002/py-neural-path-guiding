@@ -47,8 +47,8 @@ class GuidingNetwork(nn.Module):
                 "otype": "FullyFusedMLP",
                 "activation": "ReLU",
                 "output_activation": "None", # IMPORTANT: Activations are applied manually
-                "n_neurons": 128,
-                "n_hidden_layers": 8,
+                "n_neurons": 64,
+                "n_hidden_layers": 4,
             }
         }
 
@@ -110,11 +110,10 @@ class GuidingNetwork(nn.Module):
         """
         # Set to evaluation mode and disable gradients for inference speed
         self.model.eval()
+        
         with torch.no_grad():
             input_tensor = self._prepare_input(positions, view_dirs, roughness)
             # The network expects inputs in the [0, 1] range.
-            # Normalizing with the scene AABB is the proper way to do this.
-            # A simple (pos + 1)/2 is a placeholder for a [-1, 1] world.
             raw_output = self.model(input_tensor.to(self.device))
         
         # Process the raw output to get meaningful parameters

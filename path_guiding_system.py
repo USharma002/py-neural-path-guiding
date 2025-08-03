@@ -8,7 +8,7 @@ import drjit as dr
 from math_utils import *
 
 class PathGuidingSystem:
-    def __init__(self, device: str = "cuda", K: int = 8, learning_rate: float = 1e-2):
+    def __init__(self, device: str = "cuda", K: int = 20, learning_rate: float = 1e-2):
         self.device = device
         self.gnn = GuidingNetwork(device, K=K).to(device)
         self.optimizer = torch.optim.AdamW(self.gnn.model.parameters(), lr=learning_rate)
@@ -22,9 +22,6 @@ class PathGuidingSystem:
         rec = integrator.surfaceInteractionRecord
         integrator.scatter_data_into_buffer()
 
-        self.bbox_max = integrator.bbox_max.torch().to("cuda")
-        self.bbox_min = integrator.bbox_min.torch().to("cuda")
-
         if dr.width(rec.position) == 0:
             return (None,) * 6
 
@@ -32,7 +29,10 @@ class PathGuidingSystem:
         wi = rec.wi.torch() # Direction of incoming ray
         wo = rec.wo.torch() # direction sampled using bsdf
 
-        pos = (pos - self.bbox_min)/(self.bbox_max - self.bbox_min)
+        pos = 2 * ((pos - self.bbox_min)/(self.bbox_max - self.bbox_min)) - 1
+        
+        # print(pos.min(), pos.max())
+        # print(self.bbox_min, self.bbox_max)
 
         targets_li = rec.radiance.torch()
         combined_pdf = rec.woPdf.torch()
@@ -141,8 +141,10 @@ class PathGuidingSystem:
 
     def pdf(self, position, wi, roughness, wo):
         self.gnn.eval()
+
         with torch.no_grad():
-            position = (position - self.bbox_min)/(self.bbox_max - self.bbox_min)
+            position = 2 * ((position - self.bbox_min)/(self.bbox_max - self.bbox_min))  - 1
+
             vmf_params = self.gnn(position, wi, roughness)
             guiding_dist = BatchedMixedSphericalGaussianDistribution(vmf_params)
             pdf_val = guiding_dist.pdf(wo)
@@ -154,8 +156,10 @@ class PathGuidingSystem:
         Uses the trained network to sample a new direction.
         """
         self.gnn.eval()
+
         with torch.no_grad():
-            position = (position - self.bbox_min)/(self.bbox_max - self.bbox_min)
+            position = 2 * ((position - self.bbox_min)/(self.bbox_max - self.bbox_min)) - 1
+
             vmf_params = self.gnn.query(position, wi, roughness)
             
             guiding_dist = BatchedMixedSphericalGaussianDistribution(vmf_params)

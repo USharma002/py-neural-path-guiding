@@ -250,43 +250,44 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             #  Create a master mask 'do_guiding_bsdf_mis' for all paths where MIS will be performed.
             do_guiding_bsdf_mis = active_next & ~delta & (self.iteration >= 0) & inputs_valid_for_guiding & self.guiding
 
-            #  Probabilistically split the MIS-enabled paths into two groups.
-            #  'active_sample_guiding_mis': Paths that will generate their direction from the guide.
-            #  'active_sample_bsdf_mis': Paths that will use the direction from the BSDF sample taken earlier.
-            active_sample_guiding_mis = sampler.next_1d(active_next) > self.bsdfSamplingFraction
-            active_sample_guiding_mis &= do_guiding_bsdf_mis
+            if dr.any(do_guiding_bsdf_mis):
+                #  Probabilistically split the MIS-enabled paths into two groups.
+                #  'active_sample_guiding_mis': Paths that will generate their direction from the guide.
+                #  'active_sample_bsdf_mis': Paths that will use the direction from the BSDF sample taken earlier.
+                active_sample_guiding_mis = sampler.next_1d(active_next) > self.bsdfSamplingFraction
+                active_sample_guiding_mis &= do_guiding_bsdf_mis
 
-            """
-            pdf(result of sampling) = pdf(sample generated from sd tree sampling) * pdf(do sd tree sampling) + pdf(sample generated from bsdf sampling) * (1-pdf(do sd tree sampling))
-            """
-            active_sample_bsdf_without_mis = ~do_guiding_bsdf_mis & ~active_sample_guiding_mis
-            active_sample_bsdf_mis = do_guiding_bsdf_mis & ~active_sample_guiding_mis
+                """
+                pdf(result of sampling) = pdf(sample generated from sd tree sampling) * pdf(do sd tree sampling) + pdf(sample generated from bsdf sampling) * (1-pdf(do sd tree sampling))
+                """
+                active_sample_bsdf_without_mis = ~do_guiding_bsdf_mis & ~active_sample_guiding_mis
+                active_sample_bsdf_mis = do_guiding_bsdf_mis & ~active_sample_guiding_mis
 
-            active_sample_guiding_mis &= active_next
-            active_sample_bsdf_mis &= active_next
-            active_sample_bsdf_without_mis &= active_next
+                active_sample_guiding_mis &= active_next
+                active_sample_bsdf_mis &= active_next
+                active_sample_bsdf_without_mis &= active_next
 
-            # IF sampling with Guiding technique MIS
-            guided_dir, guided_pdf = self.sample_guided_direction(si.p.torch(), wi_local.torch(), si.n.torch())
-            wo_world[active_sample_guiding_mis] = si.to_world(guided_dir)
-            wo_local[active_sample_guiding_mis] = guided_dir
-            bsdf_value[active_sample_guiding_mis], bsdf_pdf[active_sample_guiding_mis] = bsdf.eval_pdf(bsdf_ctx, si, wo_local, active_sample_guiding_mis)
+                # IF sampling with Guiding technique MIS
+                guided_dir, guided_pdf = self.sample_guided_direction(si.p.torch(), wi_local.torch(), si.n.torch())
+                wo_world[active_sample_guiding_mis] = si.to_world(guided_dir)
+                wo_local[active_sample_guiding_mis] = guided_dir
+                bsdf_value[active_sample_guiding_mis], bsdf_pdf[active_sample_guiding_mis] = bsdf.eval_pdf(bsdf_ctx, si, wo_local, active_sample_guiding_mis)
 
-            # If we instead sampled from the BSDF, we still need to know Guiding PDF for MIS
-            guided_pdf_for_bsdf_sample = self.guiding_pdf(
-                si.p.torch(), wi_local.torch(), si.n.torch(), wo_local.torch()
-            )
+                # If we instead sampled from the BSDF, we still need to know Guiding PDF for MIS
+                guided_pdf_for_bsdf_sample = self.guiding_pdf(
+                    si.p.torch(), wi_local.torch(), si.n.torch(), wo_local.torch()
+                )
 
-            # dr.scatter(guided_pdf, guided_pdf_for_bsdf_sample, ray_index, active_sample_bsdf_mis)
-            combined_guided_pdf = dr.select(
-                active_sample_bsdf_mis, # The condition mask
-                guided_pdf_for_bsdf_sample,   # Value if true
-                guided_pdf # Value if false
-            )
+                # dr.scatter(guided_pdf, guided_pdf_for_bsdf_sample, ray_index, active_sample_bsdf_mis)
+                combined_guided_pdf = dr.select(
+                    active_sample_bsdf_mis, # The condition mask
+                    guided_pdf_for_bsdf_sample,   # Value if true
+                    guided_pdf # Value if false
+                )
 
-            # Finally, compute pdf and BSDF weight
-            woPdf[active_next & do_guiding_bsdf_mis] = (self.bsdfSamplingFraction * bsdf_pdf) + (1 - self.bsdfSamplingFraction) * combined_guided_pdf
-            bsdf_weight[active_next & do_guiding_bsdf_mis] = bsdf_value / woPdf
+                # Finally, compute pdf and BSDF weight
+                woPdf[active_next & do_guiding_bsdf_mis] = (self.bsdfSamplingFraction * bsdf_pdf) + (1 - self.bsdfSamplingFraction) * combined_guided_pdf
+                bsdf_weight[active_next & do_guiding_bsdf_mis] = bsdf_value / woPdf
 
             # ---- Update loop variables based on current interaction -----
 

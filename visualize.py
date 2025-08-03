@@ -296,7 +296,6 @@ class MitsubaViewer(QMainWindow):
             num_rays = self.MAIN_RESOLUTION[0] * self.MAIN_RESOLUTION[1]
             print(f"Setting up integrator for a wavefront of {num_rays} rays.")
             
-            print(self.scene.bbox().min, self.scene.bbox().max)
             self.integrator.setup(
                 num_rays=num_rays,
                 bbox_min=self.scene.bbox().min,
