@@ -87,6 +87,10 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
 
     @dr.wrap_ad(source='drjit', target='torch')
     def sample_guided_direction(self, position, wi, normal):
+        # position[position.isnan()] = 0.0
+        # wi[wi.isnan()] = 0.0
+        # normal[normal.isnan()] = 0.0
+
         with torch.no_grad():
             roughness = torch.ones((position.shape[0], 1), device=device)
             wo_pred, pdf_val = self.guiding_system.sample_guided_direction(position, wi, roughness)
@@ -106,6 +110,11 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
 
     @dr.wrap_ad(source='drjit', target='torch')
     def guiding_pdf(self, position, wi, normal, wo):
+        # position[position.isnan()] = 0.0
+        # wi[wi.isnan()] = 0.0
+        # normal[normal.isnan()] = 0.0
+        # wo[wo.isnan()] = 0.0
+
         with torch.no_grad():
             roughness = torch.ones((position.shape[0], 1), device=device)
             pdf_val = self.guiding_system.pdf(position, wi, roughness, wo)
@@ -186,24 +195,19 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             # Compute MIS weight for emitter sample from previous bounce
             ds_direct = mi.DirectionSample3f(scene, si=si, ref=prev_si)
             emitter_pdf = scene.pdf_emitter_direction(prev_si, ds_direct, ~prev_bsdf_delta)
-            # mis = mis_weight(
-            #     prev_bsdf_pdf,
-            #     emitter_pdf
-            # )
+            mis = mis_weight(
+                prev_bsdf_pdf,
+                emitter_pdf
+            )
 
             raw_Le = ds_direct.emitter.eval(si)
 
-            Le = β * raw_Le
-            # Le = β * mis * raw_Le
+            # Le = β * raw_Le
+            Le = β * mis * raw_Le
 
-            # ---------------------- Emitter sampling ----------------------
-
-            # # Should we continue tracing to reach one more vertex?
+            # Should we continue tracing to reach one more vertex?
             active_next = (depth + 1 < self.max_depth) & si.is_valid()
 
-            Lr_dir = mi.Spectrum(0.) # Don't use NEE for now
-            
-            L = L + Le + Lr_dir
 
             # ------------------ Detached BSDF sampling -------------------
             
@@ -224,6 +228,43 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             #  If we sampled a delta component, then we have a 0 probability
             #  of sampling that direction via guiding
             delta = mi.has_flag( bsdf_sample.sampled_type, mi.BSDFFlags.Delta )
+
+            # ---------------------- Emitter sampling ----------------------
+
+            # Is emitter sampling even possible on the current vertex?
+            active_em = active_next & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
+
+            # If so, randomly sample an emitter
+            ds, em_weight = scene.sample_emitter_direction(
+                si, sampler.next_2d(), True, active_em)
+            active_em &= dr.neq(ds.pdf, 0.0)
+
+            # Evaluate BSDF * cos(theta) differentiably for the emitter sample
+            wo_em = si.to_local(ds.d)
+            bsdf_value_em, bsdf_pdf_em = bsdf.eval_pdf(bsdf_ctx, si, wo_em, active_em)
+
+            # --- START of THE FIX ---
+            # Calculate the full hemisphere sampling PDF for the emitter's direction
+            # This is where we make NEE "aware" of the combined PDF
+
+            # First, get the guiding PDF for the direction sampled by NEE
+            guiding_pdf_em = self.guiding_pdf(
+                si.p.torch(),           # Current position
+                wi_local.torch(),       # Incoming direction
+                si.n.torch(),           # Surface normal
+                wo_em.torch()           # Direction towards the light
+            )
+
+            # Combine BSDF and Guiding PDFs to get the full hemisphere PDF
+            # (This must only be done where guiding is active, otherwise the PDF is just the BSDF PDF)
+            pdf_hemisphere_em = (self.bsdfSamplingFraction * bsdf_pdf_em) + ((1 - self.bsdfSamplingFraction) * guiding_pdf_em)
+            pdf_hemisphere_em = dr.select(self.guiding, pdf_hemisphere_em, bsdf_pdf_em)
+
+            # Now, calculate the correct MIS weight using the full hemisphere PDF
+            mis_em = dr.select(ds.delta, 1, mis_weight(ds.pdf, pdf_hemisphere_em))
+            # --- END of THE FIX ---
+
+            Lr_dir = β * mis_em * bsdf_value_em * em_weight
 
             # ----------------------- Neural Radiance Cache ----------------
             # L_cache = mi.Spectrum(0)
@@ -290,7 +331,8 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
                 bsdf_weight[active_next & do_guiding_bsdf_mis] = bsdf_value / woPdf
 
             # ---- Update loop variables based on current interaction -----
-
+            L = L + Le + Lr_dir
+            
             globalIndex = (ray_index * self.max_depth) + depth
             storeFlag = active & si.is_valid() # don't use nrc for training data
 
@@ -387,11 +429,11 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
                 Lo_from_next_bounce = dr.gather(mi.Spectrum, rec.product, next_vertex_idx, depth_mask)             
 
             Le_d = dr.gather(mi.Spectrum, rec.emittedRadiance, array_idx, depth_mask)
-            # Lnee_d = dr.gather(mi.Spectrum, rec.radiance_nee, array_idx, depth_mask)
+            Lnee_d = dr.gather(mi.Spectrum, rec.radiance_nee, array_idx, depth_mask)
             bsdf_d = dr.gather(mi.Spectrum, rec.bsdf, array_idx, depth_mask)
 
-            # Li_d = Lnee_d + Lo_from_next_bounce
-            Li_d = Lo_from_next_bounce
+            Li_d = Lnee_d + Lo_from_next_bounce
+            # Li_d = Lo_from_next_bounce
 
             dr.scatter(rec.radiance, Li_d, array_idx, depth_mask)
 

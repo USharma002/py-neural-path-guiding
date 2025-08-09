@@ -8,7 +8,7 @@ import drjit as dr
 from math_utils import *
 
 class PathGuidingSystem:
-    def __init__(self, device: str = "cuda", K: int = 20, learning_rate: float = 1e-2):
+    def __init__(self, device: str = "cuda", K: int = 8, learning_rate: float = 1e-2):
         self.device = device
         self.gnn = GuidingNetwork(device, K=K).to(device)
         self.optimizer = torch.optim.AdamW(self.gnn.model.parameters(), lr=learning_rate)

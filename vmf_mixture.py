@@ -6,7 +6,8 @@ import math
 from math_utils import (
     spherical_to_cartesian, cartesian_to_spherical, safe_sqrt, to_world
 )
-
+import torch
+from torch.distributions import Categorical
 from guiding_network import GuidingNetwork
 from vmf import *
 
@@ -249,14 +250,78 @@ class BatchedMixedSphericalGaussianDistribution(nn.Module):
         return torch.sum(self.lambdas * lobe_pdfs, dim=1)
 
     def sample(self):
-        lobe_indices = torch.multinomial(self.weights, num_samples=1)
+        """
+        Robust sampling from the batched mixture weights with diagnostics and fallback.
+        Returns: sampled directions tensor of shape (B, 3) on same device as self.weights.
+        """
 
-        chosen_kappas = torch.gather(self.kappas, 1, lobe_indices).squeeze(1)
-        chosen_thetas = torch.gather(self.thetas, 1, lobe_indices).squeeze(1)
-        chosen_phis = torch.gather(self.phis, 1, lobe_indices).squeeze(1)
-        
-        # Sample from the selected vMF distributions.
-        return vmf_sample_spherical(chosen_kappas, chosen_thetas, chosen_phis)
+        # Ensure weights are a float tensor on same device
+        weights = self.weights
+        device = weights.device
+        weights = weights.to(torch.float32)
+
+        # If 1D, interpret as batch size 1
+        if weights.ndim == 1:
+            weights = weights.unsqueeze(0)  # (1, K)
+
+        B, K = weights.shape
+
+        # Diagnostic checks
+        n_nan = torch.isnan(weights).sum().item()
+        n_inf = torch.isinf(weights).sum().item()
+        n_neg = (weights < 0).sum().item()
+        row_sums = weights.sum(dim=1)
+        n_zero_rows = (row_sums <= 1e-12).sum().item()
+
+        # if n_nan or n_inf or n_neg or n_zero_rows:
+        #     print("=== BatchedMixedSphericalGaussianDistribution.sample() DIAGNOSTIC ===")
+        #     print(f"weights shape: {weights.shape} device: {weights.device}")
+        #     print(f"n_nan: {n_nan}, n_inf: {n_inf}, n_neg: {n_neg}, n_zero_rows: {n_zero_rows}")
+        #     print(f"row_sums.min: {float(row_sums.min()) if row_sums.numel() else 'N/A'}, row_sums.max: {float(row_sums.max()) if row_sums.numel() else 'N/A'}")
+        #     # print the first few rows (move to CPU for safety)
+        #     print("weights[0:6]:\n", weights[:6].detach().cpu().numpy())
+        #     print("=====================================================================")
+
+        # Fix NaN/Inf: replace with zeros (we'll restore uniform if entire row zero)
+        weights = torch.where(torch.isfinite(weights), weights, torch.zeros_like(weights))
+
+        # Clamp negatives to zero
+        weights = torch.clamp(weights, min=0.0)
+
+        # If entire row sums to zero, set uniform small positive weights
+        row_sums = weights.sum(dim=1, keepdim=True)  # (B,1)
+        zero_mask = (row_sums <= 1e-12).squeeze(1)    # (B,)
+        if zero_mask.any():
+            # create uniform weights for those rows
+            num_zero = int(zero_mask.sum().item())
+            uniform = (1.0 / float(K)) * torch.ones((num_zero, K), device=device, dtype=weights.dtype)
+            weights[zero_mask] = uniform
+            row_sums = weights.sum(dim=1, keepdim=True)
+
+        # Normalize to probabilities (stable)
+        probs = weights / (row_sums + 1e-12)
+
+        # Try to sample with multinomial on device, fall back to CPU categorical on failure
+        try:
+            lobe_indices = torch.multinomial(probs, num_samples=1).squeeze(1)  # (B,)
+        except RuntimeError as e:
+            print("torch.multinomial failed on device; falling back to CPU Categorical. Error:", e)
+            probs_cpu = probs.cpu()
+            cat = Categorical(probs_cpu)
+            lobe_indices = cat.sample().to(device)
+
+        # Gather chosen vMF parameters per-batch
+        # lobe_indices shape: (B,) -> need shape (B,1) to gather along dim=1
+        idx = lobe_indices.unsqueeze(1)
+        chosen_kappas = torch.gather(self.kappas, 1, idx).squeeze(1)   # (B,)
+        chosen_thetas = torch.gather(self.thetas, 1, idx).squeeze(1)   # (B,)
+        chosen_phis   = torch.gather(self.phis, 1, idx).squeeze(1)     # (B,)
+
+        # Sample directions from selected vmf lobes
+        sampled = vmf_sample_spherical(chosen_kappas, chosen_thetas, chosen_phis)  # (B,3)
+
+        return sampled
+
 
     def entropy(self):
 

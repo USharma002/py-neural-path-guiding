@@ -5,6 +5,8 @@ import random
 import sys
 import time
 
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 # Third-Party Imports
 import drjit as dr
 import matplotlib.cm as cm
