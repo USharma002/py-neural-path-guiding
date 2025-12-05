@@ -1,25 +1,33 @@
+"""Neural network for predicting vMF mixture parameters for path guiding."""
+from __future__ import annotations
+
+import math
+from typing import Dict
+
+import tinycudann as tcnn
 import torch
 import torch.nn as nn
-import tinycudann as tcnn
-import math
 import torch.nn.functional as F
 
+
 class GuidingNetwork(nn.Module):
-    """
-    A neural network using tiny-cuda-nn to predict parameters for a 
-    von Mises-Fisher (vMF) mixture model.
+    """Neural network using tiny-cuda-nn to predict vMF mixture model parameters.
     
     The network takes a 7D input (position, view direction, roughness) and
     outputs the parameters for a mixture of K vMF distributions.
+    
+    Args:
+        device: Device to run the network on ('cuda' or 'cpu')
+        K: Number of lobes in the vMF mixture
     """
-    def __init__(self, device, K):
+    def __init__(self, device: str, K: int = 8):
         super().__init__()
         self.device = device
-        self.K = K  # Number of lobes in the mixture
+        self.K = K
 
-        # Total input dimensions = 3 (pos) + 3 (dir) + 1 (roughness) = 7
+        # Input: 3 (position) + 3 (direction) + 1 (roughness) = 7
         input_dims = 7
-        # We need 4 raw parameters per lobe: (lambda, kappa, theta, phi)
+        # Output: 4 parameters per lobe (lambda, kappa, theta, phi)
         output_dims = 4 * self.K
         
         config = {
@@ -59,8 +67,22 @@ class GuidingNetwork(nn.Module):
             network_config=config["network"],
         ).to(self.device)
 
-    def _prepare_input(self, positions, view_dirs, roughness):
-        """Helper to concatenate and validate inputs."""
+    def _prepare_input(
+        self, 
+        positions: torch.Tensor, 
+        view_dirs: torch.Tensor, 
+        roughness: torch.Tensor
+    ) -> torch.Tensor:
+        """Concatenate and validate network inputs.
+        
+        Args:
+            positions: World positions, normalized to [-1, 1]^3
+            view_dirs: View direction vectors
+            roughness: Surface roughness values
+            
+        Returns:
+            Concatenated input tensor for the network
+        """
         # A more robust implementation would normalize position based on the scene AABB
         if roughness.ndim == 1:
             roughness = roughness.unsqueeze(1)
@@ -70,11 +92,15 @@ class GuidingNetwork(nn.Module):
         input_tensor = torch.cat([positions, view_dirs, roughness], dim=1)
         return input_tensor
 
-      
-    def network_output_to_params(self, network_output):
-        """
-        Converts raw network output into vMF parameters by predicting
-        spherical coordinates directly.
+    def network_output_to_params(self, network_output: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Convert raw network output into vMF parameters.
+        
+        Args:
+            network_output: Raw network output tensor of shape (N, 4*K)
+            
+        Returns:
+            Dictionary with keys 'lambda', 'kappa', 'theta', 'phi',
+            each of shape (N, K)
         """
         # Reshape flat output: (N, 4*K) -> (N, K, 4)
         raw_params = network_output.view(-1, self.K, 4)
@@ -97,16 +123,27 @@ class GuidingNetwork(nn.Module):
         kappa = torch.clamp(kappa, min=1e-5, max=1000.0)
         
         return {
-            "lambda": lambda_, # Shape: (N, K)
-            "kappa": kappa,    # Shape: (N, K)
-            "theta": theta,    # Shape: (N, K)
-            "phi": phi         # Shape: (N, K)
+            "lambda": lambda_,  # Shape: (N, K)
+            "kappa": kappa,     # Shape: (N, K)
+            "theta": theta,     # Shape: (N, K)
+            "phi": phi          # Shape: (N, K)
         }
-    
 
-    def query(self, positions, view_dirs, roughness):
-        """
-        Queries the network and returns processed vMF mixture parameters.
+    def query(
+        self, 
+        positions: torch.Tensor, 
+        view_dirs: torch.Tensor, 
+        roughness: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Query the network for vMF parameters (inference mode).
+        
+        Args:
+            positions: World positions, normalized to [-1, 1]^3
+            view_dirs: View direction vectors
+            roughness: Surface roughness values
+            
+        Returns:
+            Dictionary of vMF mixture parameters
         """
         # Set to evaluation mode and disable gradients for inference speed
         self.model.eval()
@@ -119,9 +156,21 @@ class GuidingNetwork(nn.Module):
         # Process the raw output to get meaningful parameters
         return self.network_output_to_params(raw_output)
 
-    def forward(self, positions, view_dirs, roughness):
-        """
-        A forward pass for TRAINING. Gradients are tracked.
+    def forward(
+        self, 
+        positions: torch.Tensor, 
+        view_dirs: torch.Tensor, 
+        roughness: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Forward pass for training (gradients are tracked).
+        
+        Args:
+            positions: World positions, normalized to [-1, 1]^3
+            view_dirs: View direction vectors
+            roughness: Surface roughness values
+            
+        Returns:
+            Dictionary of vMF mixture parameters
         """
         # Note: No model.eval() and no torch.no_grad()
         input_tensor = self._prepare_input(positions, view_dirs, roughness)

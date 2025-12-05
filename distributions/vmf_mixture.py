@@ -1,27 +1,50 @@
+"""Von Mises-Fisher mixture distributions for path guiding."""
+from __future__ import annotations
+
+import math
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
-import math
-
-
-from math_utils import (
-    spherical_to_cartesian, cartesian_to_spherical, safe_sqrt, to_world
-)
-import torch
+import torch.nn.functional as F
 from torch.distributions import Categorical
-from guiding_network import GuidingNetwork
-from vmf import *
 
+from guiding.config import get_logger
+from utils.math_utils import spherical_to_cartesian, cartesian_to_spherical
+from distributions.vmf import VMFDistribution
+
+logger = get_logger("vmf_mixture")
+
+# Constants
 M_EPSILON = 1e-5
-M_INV_4PI = 1.0 / (4 * math.pi)
-M_INV_2PI = 1.0 / (2 * math.pi)
-M_2PI = 2 * math.pi
+M_INV_4PI = 1.0 / (4.0 * math.pi)
+M_INV_2PI = 1.0 / (2.0 * math.pi)
+M_2PI = 2.0 * math.pi
 N_DIM_VMF = 4  # [lambda, kappa, theta, phi]
 
-def vmf_sample_spherical(kappas, thetas, phis):
+# Diffuse lobe approximation for cosine-weighted hemisphere sampling
+VMF_DIFFUSE_LOBE_KAPPA = 2.188
+
+
+def vmf_sample_spherical(
+    kappas: torch.Tensor, 
+    thetas: torch.Tensor, 
+    phis: torch.Tensor
+) -> torch.Tensor:
+    """Sample directions from vMF distributions with given parameters.
+    
+    Args:
+        kappas: Concentration parameters (B,)
+        thetas: Polar angles of mean directions (B,)
+        phis: Azimuthal angles of mean directions (B,)
+        
+    Returns:
+        Sampled directions (B, 3)
+    """
     device = kappas.device
     batch_size = kappas.shape[0]
 
-    mu = spherical_to_cartesian(thetas, phis) # (B, 3)
+    mu = spherical_to_cartesian(thetas, phis)  # (B, 3)
 
     kappa_zero_mask = kappas < 1e-5
     u = torch.rand(batch_size, device=device)
@@ -53,31 +76,43 @@ def vmf_sample_spherical(kappas, thetas, phis):
     
     return samples
 
+# Diffuse lobe approximation for cosine-weighted hemisphere sampling
+VMF_DIFFUSE_LOBE_KAPPA = 2.188
+
+
 class VMFKernel(nn.Module):
-    def __init__(self, lambda_=0.0, kappa=0.0, theta=0.0, phi=0.0):
+    """A single von Mises-Fisher kernel with weight, concentration, and direction."""
+    
+    def __init__(self, lambda_: float = 0.0, kappa: float = 0.0, theta: float = 0.0, phi: float = 0.0):
         super().__init__()
         self.lambda_ = torch.as_tensor(lambda_, dtype=torch.float32)
         self.kappa = torch.as_tensor(kappa, dtype=torch.float32)
         self.theta = torch.as_tensor(theta, dtype=torch.float32)
         self.phi = torch.as_tensor(phi, dtype=torch.float32)
 
-    def get_spherical_dir(self):
+    def get_spherical_dir(self) -> torch.Tensor:
+        """Get the mean direction in spherical coordinates."""
         return torch.stack([self.theta, self.phi])
 
-    def get_cartesian_dir(self):
+    def get_cartesian_dir(self) -> torch.Tensor:
+        """Get the mean direction in Cartesian coordinates."""
         return spherical_to_cartesian(self.theta, self.phi)
 
-    def sample(self, u):
+    def sample(self, u: torch.Tensor) -> torch.Tensor:
+        """Sample a direction from this kernel."""
         return VMFDistribution(self.kappa).sample_spherical(u, self.theta, self.phi)
 
-    def eval(self, wi):
+    def eval(self, wi: torch.Tensor) -> torch.Tensor:
+        """Evaluate the weighted PDF."""
         return self.lambda_ * self.pdf(wi)
 
-    def pdf(self, wi):
+    def pdf(self, wi: torch.Tensor) -> torch.Tensor:
+        """Evaluate the normalized PDF."""
         return VMFDistribution(self.kappa).eval_spherical(wi, self.theta, self.phi)
 
-    def product(self, other):
-        def norm(kappa):
+    def product(self, other: VMFKernel) -> None:
+        """Compute the product of this kernel with another (in-place)."""
+        def norm(kappa: torch.Tensor) -> torch.Tensor:
             kappa = torch.clamp(kappa, min=1e-8)
             return torch.where(
                 kappa < self.min_valid_kappa,
@@ -113,60 +148,15 @@ class VMFKernel(nn.Module):
     min_valid_kappa = 1e-5
 
 
-class MixedSphericalGaussianDistribution(nn.Module):
-    def __init__(self, network_params, batch_idx=0):
-        super().__init__()
-        lambdas = network_params['lambda'][batch_idx].to(torch.float32)
-        kappas = network_params['kappa'][batch_idx].to(torch.float32)
-        thetas = network_params['theta'][batch_idx].to(torch.float32)
-        phis = network_params['phi'][batch_idx].to(torch.float32)
-        
-        self.N = kappas.shape[0]
-        self.kernels = nn.ModuleList()
-        
-        for i in range(self.N):
-            kernel = VMFKernel(
-                lambda_=lambdas[i],
-                kappa=kappas[i],
-                theta=thetas[i],
-                phi=phis[i]
-            )
-            self.kernels.append(kernel)
-            
-        self.totalWeight = torch.sum(lambdas)
-        if self.totalWeight < M_EPSILON:
-            self.totalWeight = torch.tensor(M_EPSILON)
-            
-        self.weights = lambdas / self.totalWeight
-
-
-    def eval(self, wi):
-        wi_tensor = torch.as_tensor(wi, dtype=torch.float32, device=self.weights.device)
-        return sum(kernel.eval(wi_tensor) for kernel in self.kernels)
-
-    def pdf(self, wi):
-        """Computes the normalized probability density function: sum(weight_i * pdf_i)."""
-        wi_tensor = torch.as_tensor(wi, dtype=torch.float32, device=self.weights.device)
-        return sum(self.weights[i] * self.kernels[i].pdf(wi_tensor) for i in range(self.N))
-
-    def apply_cosine_lobe(self, normal):
-        normal_tensor = torch.as_tensor(normal, dtype=torch.float32, device=self.weights.device)
-        sph_normal = cartesian_to_spherical(normal_tensor)
-        cosine_vmf = VMFKernel(1.0, self.VMF_DIFFUSE_LOBE, sph_normal[0], sph_normal[1])
-
-        new_lambdas = []
-        for kernel in self.kernels:
-            kernel.product(cosine_vmf)
-            new_lambdas.append(kernel.lambda_)
-        
-        self.totalWeight = torch.sum(torch.stack(new_lambdas))
-        if self.totalWeight < M_EPSILON:
-            self.totalWeight = torch.tensor(M_EPSILON)
-        self.weights = torch.stack(new_lambdas) / self.totalWeight
-
-
 class BatchedMixedSphericalGaussianDistribution(nn.Module):
-    def __init__(self, network_params):
+    """Batched mixture of vMF distributions for efficient GPU computation.
+    
+    Args:
+        network_params: Dictionary with 'lambda', 'kappa', 'theta', 'phi' tensors
+                       of shape (batch_size, K)
+    """
+    
+    def __init__(self, network_params: Dict[str, torch.Tensor]):
         super().__init__()
     
         # (batch_size, K)
@@ -183,9 +173,15 @@ class BatchedMixedSphericalGaussianDistribution(nn.Module):
         
         self.weights = self.lambdas / self.totalWeight.unsqueeze(1)
 
-
-    def _get_lobe_pdfs(self, wi):
-        # --- No changes needed here ---
+    def _get_lobe_pdfs(self, wi: torch.Tensor) -> torch.Tensor:
+        """Compute PDFs for all lobes in the mixture.
+        
+        Args:
+            wi: Direction vectors of shape (B, 3)
+            
+        Returns:
+            Lobe PDFs of shape (B, K)
+        """
         B, _ = wi.shape
         mus = spherical_to_cartesian(self.thetas, self.phis)
         dot_products = torch.sum(mus * wi.unsqueeze(1), dim=2)
@@ -227,32 +223,35 @@ class BatchedMixedSphericalGaussianDistribution(nn.Module):
         
         return lobe_pdfs
 
-    def pdf(self, wi):
-        """
-        Computes the normalized PDF for an entire batch of directions.
-        """
-        # Get the PDFs for all lobes. Shape: (B, K)
-        lobe_pdfs = self._get_lobe_pdfs(wi)
+    def pdf(self, wi: torch.Tensor) -> torch.Tensor:
+        """Compute the normalized PDF for a batch of directions.
         
-        # Multiply by normalized mixture weights and sum along the K dimension.
-        # Final shape: (B,)
+        Args:
+            wi: Direction vectors of shape (B, 3)
+            
+        Returns:
+            PDF values of shape (B,)
+        """
+        lobe_pdfs = self._get_lobe_pdfs(wi)
         return torch.sum(self.weights * lobe_pdfs, dim=1)
 
-    def eval(self, wi):
-        """
-        Computes the unnormalized, scaled value for an entire batch of directions.
-        """
-        # Get the PDFs for all lobes. Shape: (B, K)
-        lobe_pdfs = self._get_lobe_pdfs(wi)
+    def eval(self, wi: torch.Tensor) -> torch.Tensor:
+        """Compute the unnormalized weighted PDF for a batch of directions.
         
-        # Multiply by unnormalized lambdas and sum along the K dimension.
-        # Final shape: (B,)
+        Args:
+            wi: Direction vectors of shape (B, 3)
+            
+        Returns:
+            Weighted PDF values of shape (B,)
+        """
+        lobe_pdfs = self._get_lobe_pdfs(wi)
         return torch.sum(self.lambdas * lobe_pdfs, dim=1)
 
-    def sample(self):
-        """
-        Robust sampling from the batched mixture weights with diagnostics and fallback.
-        Returns: sampled directions tensor of shape (B, 3) on same device as self.weights.
+    def sample(self) -> torch.Tensor:
+        """Sample directions from the mixture distribution.
+        
+        Returns:
+            Sampled directions of shape (B, 3)
         """
 
         # Ensure weights are a float tensor on same device
@@ -305,7 +304,7 @@ class BatchedMixedSphericalGaussianDistribution(nn.Module):
         try:
             lobe_indices = torch.multinomial(probs, num_samples=1).squeeze(1)  # (B,)
         except RuntimeError as e:
-            print("torch.multinomial failed on device; falling back to CPU Categorical. Error:", e)
+            logger.warning(f"torch.multinomial failed on device; falling back to CPU Categorical. Error: {e}")
             probs_cpu = probs.cpu()
             cat = Categorical(probs_cpu)
             lobe_indices = cat.sample().to(device)
@@ -318,13 +317,16 @@ class BatchedMixedSphericalGaussianDistribution(nn.Module):
         chosen_phis   = torch.gather(self.phis, 1, idx).squeeze(1)     # (B,)
 
         # Sample directions from selected vmf lobes
-        sampled = vmf_sample_spherical(chosen_kappas, chosen_thetas, chosen_phis)  # (B,3)
+        sampled = vmf_sample_spherical(chosen_kappas, chosen_thetas, chosen_phis)  # (B, 3)
 
         return sampled
 
-
-    def entropy(self):
-
-        epsilon = 1e-8
+    def entropy(self) -> torch.Tensor:
+        """Compute the entropy of the mixture weights.
+        
+        Returns:
+            Entropy value for each sample in the batch
+        """
+        epsilon = M_EPSILON
         H = -torch.sum(self.weights * torch.log(self.weights + epsilon), dim=-1)
         return H

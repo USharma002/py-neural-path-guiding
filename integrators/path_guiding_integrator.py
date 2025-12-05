@@ -1,65 +1,73 @@
-from __future__ import annotations # Delayed parsing of type annotations
+"""Path guiding integrator with MIS between BSDF and neural guiding."""
+from __future__ import annotations
 
-import mitsuba as mi
+from typing import List, Tuple, Optional
+
 import drjit as dr
-mi.set_variant("cuda_ad_rgb")
-
-from path_guiding_system import PathGuidingSystem
-from surface_intersection_record import SurfaceInteractionRecord
-from nrc import NeuralRadianceCache
-from typing import Tuple
-
+import mitsuba as mi
 import torch
 
-from math_utils import *
+mi.set_variant("cuda_ad_rgb")
 
-device = "cuda"
+from guiding.config import get_logger
+from networks.nrc import NeuralRadianceCache
+from guiding.system import PathGuidingSystem
+from rendering.surface_intersection_record import SurfaceInteractionRecord
+from sensor.spherical import GTSphericalCamera
 
-# wo : outgoing path direction (where the light will come from)
-# wi : incoming path direction (where light will go after coming)
+logger = get_logger("integrator")
+DEVICE = "cuda"
 
-epsilon = 0.00001
-def mis_weight(pdf_a, pdf_b):
-    """
-        Compute the Multiple Importance Sampling (MIS) weight given the densities
-        of two sampling strategies according to the power heuristic.
+
+def mis_weight(pdf_a: mi.Float, pdf_b: mi.Float) -> mi.Float:
+    """Compute MIS weight using the power heuristic.
+    
+    Args:
+        pdf_a: PDF of the first sampling strategy
+        pdf_b: PDF of the second sampling strategy
+        
+    Returns:
+        MIS weight for strategy A
     """
     a2 = dr.sqr(pdf_a)
     result = dr.select(pdf_a > 0, a2 / dr.fma(pdf_b, pdf_b, a2), 0)
-    result[ dr.isnan( result ) ] = 0
+    result[dr.isnan(result)] = 0
     return result
 
 
 class PathGuidingIntegrator(mi.SamplingIntegrator):
-    """Simple path tracer with MIS + NEE."""
+    """Path tracer with neural path guiding using vMF mixtures.
+    
+    Implements MIS between BSDF sampling and neural guiding distribution,
+    combined with Next Event Estimation (NEE).
+    
+    Args:
+        props: Mitsuba properties dictionary
+    """
 
-    def __init__(self: mi.SamplingIntegrator, props: mi.Properties):
+    def __init__(self: mi.SamplingIntegrator, props: mi.Properties) -> None:
         super().__init__(props)
         
-        self.max_depth = props.get('max_depth', 5)
-        self.rr_depth = props.get('rr_depth', 5)
-        self.num_rays = 0
+        self.max_depth: int = props.get('max_depth', 5)
+        self.rr_depth: int = props.get('rr_depth', 5)
+        self.num_rays: int = 0
 
-        """
-            When guiding, we perform MIS with the balance heuristic between the guiding
-            distribution and the BSDF, combined with probabilistically choosing one of the
-            two sampling methods. This factor controls how often the BSDF is sampled
-            vs. how often the guiding distribution is sampled.
-            Default = 0.5 (50%)
-        """
-        self.bsdfSamplingFraction = None
-        self.iteration = 0
+        # BSDF sampling fraction for MIS (0.5 = equal weight)
+        self.bsdfSamplingFraction: Optional[float] = None
+        self.iteration: int = 0
         
-        self.surfaceInteractionRecord: SurfaceInteractionRecord = None
+        self.surfaceInteractionRecord: Optional[SurfaceInteractionRecord] = None
         
         # For variance calculation
         self.sumL = mi.Spectrum(0)
         self.sumL2 = mi.Spectrum(0)
 
-        self.nrc_system = NeuralRadianceCache(device="cuda")
-        self.nrc_query_prob = props.get('nrc_query_prob', 0.8) # 80% chance to query NRC after 1st bounce
+        # Neural Radiance Cache
+        self.nrc_system = NeuralRadianceCache(device=DEVICE)
+        self.nrc_query_prob: float = props.get('nrc_query_prob', 0.8)
 
-        self.guiding_system = PathGuidingSystem()
+        # Path Guiding System (uses USE_NIS flag internally)
+        self.guiding_system = PathGuidingSystem(device=DEVICE)
         self.guiding = mi.Bool(False)
 
     def setup(
@@ -70,6 +78,15 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
         bsdfSamplingFraction: float = 0.5,
         isStoreNEERadiance: bool = False
     ) -> None:
+        """Initialize the integrator for rendering.
+        
+        Args:
+            num_rays: Total number of rays per frame
+            bbox_min: Scene bounding box minimum
+            bbox_max: Scene bounding box maximum  
+            bsdfSamplingFraction: Fraction of samples from BSDF (vs guiding)
+            isStoreNEERadiance: Whether to store NEE radiance for training
+        """
 
         self.num_rays = num_rays
         self.array_size = self.num_rays * self.max_depth
@@ -84,57 +101,89 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
         self.guiding_system.bbox_min = bbox_min.torch().to("cuda")
 
         self.surfaceInteractionRecord = dr.zeros(SurfaceInteractionRecord, shape= self.array_size)
+        self._data_scattered = False  # Track if scatter_data_into_buffer has been called
 
     @dr.wrap_ad(source='drjit', target='torch')
-    def sample_guided_direction(self, position, wi, normal):
-        # position[position.isnan()] = 0.0
-        # wi[wi.isnan()] = 0.0
-        # normal[normal.isnan()] = 0.0
-
+    def sample_guided_direction(
+        self, 
+        position: torch.Tensor, 
+        wi: torch.Tensor, 
+        normal: torch.Tensor
+    ) -> Tuple[mi.Vector3f, mi.Float]:
+        """Sample a direction from the guiding distribution.
+        
+        Args:
+            position: World positions
+            wi: Incoming directions
+            normal: Surface normals (unused, kept for API compatibility)
+            
+        Returns:
+            Tuple of (sampled direction, PDF value)
+        """
         with torch.no_grad():
-            roughness = torch.ones((position.shape[0], 1), device=device)
+            roughness = torch.ones((position.shape[0], 1), device=DEVICE)
             wo_pred, pdf_val = self.guiding_system.sample_guided_direction(position, wi, roughness)
-
-            return mi.Vector3f( wo_pred ), mi.Float( pdf_val )
+            return mi.Vector3f(wo_pred), mi.Float(pdf_val)
 
     @dr.wrap_ad(source='drjit', target='torch')
-    def query_nrc(self, positions, normals, view_dirs):
-        """Wrapper to query the NRC with correct arguments."""
+    def query_nrc(
+        self, 
+        positions: torch.Tensor, 
+        normals: torch.Tensor, 
+        view_dirs: torch.Tensor
+    ) -> mi.Spectrum:
+        """Query the Neural Radiance Cache."""
         with torch.no_grad():
-            roughness = torch.ones((positions.shape[0], 1), device=device)
+            roughness = torch.ones((positions.shape[0], 1), device=DEVICE)
             L_nrc = self.nrc_system.query(positions, normals, view_dirs, roughness).float()
-
-            return mi.Spectrum( L_nrc )
+            return mi.Spectrum(L_nrc)
             
 
 
     @dr.wrap_ad(source='drjit', target='torch')
-    def guiding_pdf(self, position, wi, normal, wo):
-        # position[position.isnan()] = 0.0
-        # wi[wi.isnan()] = 0.0
-        # normal[normal.isnan()] = 0.0
-        # wo[wo.isnan()] = 0.0
-
+    def guiding_pdf(
+        self, 
+        position: torch.Tensor, 
+        wi: torch.Tensor, 
+        normal: torch.Tensor, 
+        wo: torch.Tensor
+    ) -> mi.Float:
+        """Evaluate the guiding distribution PDF.
+        
+        Args:
+            position: World positions
+            wi: Incoming directions
+            normal: Surface normals (unused, kept for API compatibility)
+            wo: Directions to evaluate
+            
+        Returns:
+            PDF values
+        """
         with torch.no_grad():
-            roughness = torch.ones((position.shape[0], 1), device=device)
-            pdf_val = self.guiding_system.pdf(position, wi, roughness, wo)
-            return mi.Float( pdf_val )
+            roughness = torch.ones((position.shape[0], 1), device=DEVICE)
+            pdf_val = self.guiding_system.pdf(position, wi, wo, roughness)
+            return mi.Float(pdf_val)
 
-    def set_guiding(self, guiding_active: bool = False):
+    def set_guiding(self, guiding_active: bool = False) -> None:
+        """Enable or disable path guiding.
+        
+        Args:
+            guiding_active: Whether to use neural path guiding
+        """
         if guiding_active:
             self.bsdfSamplingFraction = 0.5
         else:
             self.bsdfSamplingFraction = 1.0
-
         self.guiding = mi.Bool(guiding_active)
 
-    def set_iteration(self: mi.SamplingIntegrator, iteration: int):
-        """Sets the current rendering iteration number."""
+    def set_iteration(self: mi.SamplingIntegrator, iteration: int) -> None:
+        """Set the current rendering iteration number."""
         self.iteration = iteration
 
-
-    def resetRayPathData(self: mi.SamplingIntegrator):
-        self.surfaceInteractionRecord = dr.zeros(SurfaceInteractionRecord, shape= self.array_size)
+    def resetRayPathData(self: mi.SamplingIntegrator) -> None:
+        """Reset the surface interaction record buffer."""
+        self.surfaceInteractionRecord = dr.zeros(SurfaceInteractionRecord, shape=self.array_size)
+        self._data_scattered = False
 
     def sample(
         self: mi.SamplingIntegrator, 
@@ -145,23 +194,36 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
         active: bool = True,
         aovs: mi.Float = None,
     ) -> Tuple[mi.Color3f, bool, List[float]]:
+        """Sample radiance along a ray using path tracing with optional guiding.
+        
+        Args:
+            scene: The scene to render
+            sampler: Random number sampler
+            ray_: Primary ray to trace
+            medium: Participating medium (unused)
+            active: Active lanes mask
+            aovs: Arbitrary output variables (unused)
+            
+        Returns:
+            Tuple of (radiance, valid mask, AOV list)
+        """
 
         # BSDF Context for Path Tracing
         bsdf_ctx = mi.BSDFContext()
 
-        # Copy input arguments to avoid mutating the caller's state
+        # Copy input ray to avoid mutating caller's state
         ray = mi.Ray3f(ray_)
 
-        depth = mi.UInt32(0)      # Depth of current vertex
-        L = mi.Spectrum(0)        # Radiance accumulator
-        β = mi.Spectrum(1)        # Path throughput weight
-        η = mi.Float(1)           # Index of refraction
-        active = mi.Bool(active)  # Active SIMD lanes
+        depth = mi.UInt32(0)       # Current path depth
+        L = mi.Spectrum(0)         # Radiance accumulator
+        β = mi.Spectrum(1)         # Path throughput weight
+        η = mi.Float(1)            # Index of refraction
+        active = mi.Bool(active)   # Active SIMD lanes
 
         self.resetRayPathData()
 
-        # index to store the data for rays
-        ray_index = dr.arange( mi.UInt32, dr.width(ray) )
+        # Index for storing per-ray data
+        ray_index = dr.arange(mi.UInt32, dr.width(ray))
         
 		# Variables caching information from the previous bounce
         prev_si = dr.zeros(mi.SurfaceInteraction3f)
@@ -243,64 +305,44 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             wo_em = si.to_local(ds.d)
             bsdf_value_em, bsdf_pdf_em = bsdf.eval_pdf(bsdf_ctx, si, wo_em, active_em)
 
-            # --- START of THE FIX ---
-            # Calculate the full hemisphere sampling PDF for the emitter's direction
-            # This is where we make NEE "aware" of the combined PDF
-
-            # First, get the guiding PDF for the direction sampled by NEE
+            # Calculate full hemisphere PDF for MIS with NEE
             guiding_pdf_em = self.guiding_pdf(
-                si.p.torch(),           # Current position
-                wi_local.torch(),       # Incoming direction
-                si.n.torch(),           # Surface normal
-                wo_em.torch()           # Direction towards the light
+                si.p.torch(),
+                wi_local.torch(),
+                si.n.torch(),
+                wo_em.torch()
             )
 
-            # Combine BSDF and Guiding PDFs to get the full hemisphere PDF
-            # (This must only be done where guiding is active, otherwise the PDF is just the BSDF PDF)
+            # Combine BSDF and Guiding PDFs for the full hemisphere PDF
             pdf_hemisphere_em = (self.bsdfSamplingFraction * bsdf_pdf_em) + ((1 - self.bsdfSamplingFraction) * guiding_pdf_em)
             pdf_hemisphere_em = dr.select(self.guiding, pdf_hemisphere_em, bsdf_pdf_em)
 
-            # Now, calculate the correct MIS weight using the full hemisphere PDF
+            # Calculate MIS weight using the full hemisphere PDF
             mis_em = dr.select(ds.delta, 1, mis_weight(ds.pdf, pdf_hemisphere_em))
-            # --- END of THE FIX ---
 
             Lr_dir = β * mis_em * bsdf_value_em * em_weight
 
-            # ----------------------- Neural Radiance Cache ----------------
-            # L_cache = mi.Spectrum(0)
-
+            # NOTE: Neural Radiance Cache (NRC) integration is disabled
+            # Uncomment and complete the following to enable NRC:
             # query_nrc_mask = (depth > 2) & si.is_valid() & ~delta & active
-            # inputs_valid_for_caching = dr.all(dr.isfinite(si.p))
-
-            # use_cache = query_nrc_mask & (sampler.next_1d() < self.nrc_query_prob) & inputs_valid_for_caching
-
-            # predicted_radiance_t = self.query_nrc(si.p.torch(), si.n.torch(), wo_world.torch())
-            # L_cache = mi.Spectrum(predicted_radiance_t)
-
-            # bsdf_val, _ = bsdf.eval_pdf(bsdf_ctx, si, wo_local, use_cache)
-
+            # use_cache = query_nrc_mask & (sampler.next_1d() < self.nrc_query_prob)
+            # L_cache = self.query_nrc(si.p.torch(), si.n.torch(), wo_world.torch())
             # L += dr.select(use_cache, β * bsdf_val * L_cache, mi.Spectrum(0.))
-
             # active_next &= ~use_cache
 
-            # ------------------ BSDF or Guiding ? --------------------------
+            # ------------------- BSDF or Guiding Sampling -----------------
 
             inputs_valid_for_guiding = dr.all(dr.isfinite(si.p))
-            #  Check if the surface is suitable for MIS (not a perfect delta reflection/refraction).
-            #  Check if guiding is even active for this iteration.
-            #  Create a master mask 'do_guiding_bsdf_mis' for all paths where MIS will be performed.
+            
+            # Check if surface is suitable for MIS (not delta) and guiding is active
             do_guiding_bsdf_mis = active_next & ~delta & (self.iteration >= 0) & inputs_valid_for_guiding & self.guiding
 
             if dr.any(do_guiding_bsdf_mis):
-                #  Probabilistically split the MIS-enabled paths into two groups.
-                #  'active_sample_guiding_mis': Paths that will generate their direction from the guide.
-                #  'active_sample_bsdf_mis': Paths that will use the direction from the BSDF sample taken earlier.
+                # Probabilistically split paths between guiding and BSDF sampling
                 active_sample_guiding_mis = sampler.next_1d(active_next) > self.bsdfSamplingFraction
                 active_sample_guiding_mis &= do_guiding_bsdf_mis
 
-                """
-                pdf(result of sampling) = pdf(sample generated from sd tree sampling) * pdf(do sd tree sampling) + pdf(sample generated from bsdf sampling) * (1-pdf(do sd tree sampling))
-                """
+                # Combined PDF: p(wo) = bsdfFraction * p_bsdf(wo) + (1-bsdfFraction) * p_guide(wo)
                 active_sample_bsdf_without_mis = ~do_guiding_bsdf_mis & ~active_sample_guiding_mis
                 active_sample_bsdf_mis = do_guiding_bsdf_mis & ~active_sample_guiding_mis
 
@@ -308,25 +350,24 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
                 active_sample_bsdf_mis &= active_next
                 active_sample_bsdf_without_mis &= active_next
 
-                # IF sampling with Guiding technique MIS
+                # Sample from guiding distribution
                 guided_dir, guided_pdf = self.sample_guided_direction(si.p.torch(), wi_local.torch(), si.n.torch())
                 wo_world[active_sample_guiding_mis] = si.to_world(guided_dir)
                 wo_local[active_sample_guiding_mis] = guided_dir
                 bsdf_value[active_sample_guiding_mis], bsdf_pdf[active_sample_guiding_mis] = bsdf.eval_pdf(bsdf_ctx, si, wo_local, active_sample_guiding_mis)
 
-                # If we instead sampled from the BSDF, we still need to know Guiding PDF for MIS
+                # For BSDF-sampled paths, still need guiding PDF for MIS
                 guided_pdf_for_bsdf_sample = self.guiding_pdf(
                     si.p.torch(), wi_local.torch(), si.n.torch(), wo_local.torch()
                 )
 
-                # dr.scatter(guided_pdf, guided_pdf_for_bsdf_sample, ray_index, active_sample_bsdf_mis)
                 combined_guided_pdf = dr.select(
-                    active_sample_bsdf_mis, # The condition mask
-                    guided_pdf_for_bsdf_sample,   # Value if true
-                    guided_pdf # Value if false
+                    active_sample_bsdf_mis,
+                    guided_pdf_for_bsdf_sample,
+                    guided_pdf
                 )
 
-                # Finally, compute pdf and BSDF weight
+                # Compute combined PDF and BSDF weight
                 woPdf[active_next & do_guiding_bsdf_mis] = (self.bsdfSamplingFraction * bsdf_pdf) + (1 - self.bsdfSamplingFraction) * combined_guided_pdf
                 bsdf_weight[active_next & do_guiding_bsdf_mis] = bsdf_value / woPdf
 
@@ -353,7 +394,6 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             # dr.scatter(self.surfaceInteractionRecord.direction_nee, value= dirToCanonical(ds.d), index= globalIndex, active= isStoreNEERadiance)
             dr.scatter(self.surfaceInteractionRecord.emittedRadiance, value= Le / β, index= globalIndex, active= storeFlag)
 
-            #   The two is only difference if we sample material together with the tree: if(sample.x >= bsdfSamplingFraction) woPdf = bsdfPdf * bsdfSamplingFraction;
             dr.scatter(self.surfaceInteractionRecord.woPdf, value= woPdf, index= globalIndex, active= storeFlag)
             dr.scatter(self.surfaceInteractionRecord.bsdfPdf, value= bsdf_pdf, index= globalIndex, active= storeFlag)
 
@@ -401,12 +441,11 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
 
         return (L, dr.neq(depth, 0), [])
 
-          
-      
-    def process_incoming_radiance(self: mi.SamplingIntegrator, Lfinal : mi.Spectrum) -> None:
-        """
-        Calculate incoming radiance at each vertex by propagating radiance
-        backwards from the end of each path, correctly including NEE.
+    def process_incoming_radiance(self: mi.SamplingIntegrator, Lfinal: mi.Spectrum) -> None:
+        """Calculate incoming radiance by propagating backwards from path endpoints.
+        
+        Args:
+            Lfinal: Final accumulated radiance (unused, kept for API)
         """
 
         rec = self.surfaceInteractionRecord
@@ -441,50 +480,56 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             dr.scatter(rec.product, Lo_d, array_idx, depth_mask)
 
     def scatter_data_into_buffer(self: mi.SamplingIntegrator) -> None:
-        """
-            Scatter surface interaction data into buffer.
-            This also filter out invalid surface interactions before scattering.
-        """
-
-        # Remove surfaceInteractionRecord that are inactive. This modifies the array size.
-        isActive = self.surfaceInteractionRecord.active
-
-        # Filter NaN radiance
-        self.surfaceInteractionRecord.radiance[ dr.isnan(self.surfaceInteractionRecord.radiance) ] = 0
-        self.surfaceInteractionRecord.radiance_nee[ dr.isnan(self.surfaceInteractionRecord.radiance_nee) ] = 0
+        """Filter and compact surface interaction data for training.
         
-        # Check if both radiance is zero then also filter out
-        radiance_zero = dr.eq( mi.luminance(self.surfaceInteractionRecord.radiance), 0 )
-        radiance_nee_zero = dr.eq( mi.luminance( self.surfaceInteractionRecord.radiance_nee ), 0 )
+        Removes inactive interactions, NaN values, and zero-radiance samples.
+        This method is idempotent - calling it multiple times has no additional effect.
+        """
+        # Skip if already scattered this frame
+        if getattr(self, '_data_scattered', False):
+            return
+            
+        rec = self.surfaceInteractionRecord
+        isActive = rec.active
+
+        # Filter NaN radiance values
+        rec.radiance[dr.isnan(rec.radiance)] = 0
+        rec.radiance_nee[dr.isnan(rec.radiance_nee)] = 0
+        
+        # Filter zero radiance samples
+        radiance_zero = dr.eq(mi.luminance(rec.radiance), 0)
+        radiance_nee_zero = dr.eq(mi.luminance(rec.radiance_nee), 0)
         bothRadianceZero = radiance_zero & radiance_nee_zero
 
-        # Remove woPdf = 0 or NaN
-        woPdf_zero = dr.eq( self.surfaceInteractionRecord.woPdf, 0 )
-        woPdf_nan = dr.isnan( self.surfaceInteractionRecord.woPdf )
+        # Filter invalid PDF values
+        woPdf_zero = dr.eq(rec.woPdf, 0)
+        woPdf_nan = dr.isnan(rec.woPdf)
         
         activeIndex = dr.compress(isActive & ~bothRadianceZero & ~woPdf_zero & ~woPdf_nan)
 
-
-        # If there is no active element then exit
-        if( dr.width( activeIndex ) == 0 ):
+        if dr.width(activeIndex) == 0:
+            self._data_scattered = True
             return
-            
-        self.surfaceInteractionRecord.position = dr.gather( type(self.surfaceInteractionRecord.position), self.surfaceInteractionRecord.position, activeIndex )
-        self.surfaceInteractionRecord.normal = dr.gather( type(self.surfaceInteractionRecord.normal), self.surfaceInteractionRecord.normal, activeIndex )
         
-        self.surfaceInteractionRecord.wo = dr.gather( type(self.surfaceInteractionRecord.wo), self.surfaceInteractionRecord.wo, activeIndex )
-        self.surfaceInteractionRecord.wo_world = dr.gather( type(self.surfaceInteractionRecord.wo_world), self.surfaceInteractionRecord.wo_world, activeIndex )
-        self.surfaceInteractionRecord.wi = dr.gather( type(self.surfaceInteractionRecord.wi), self.surfaceInteractionRecord.wi, activeIndex )
-        self.surfaceInteractionRecord.radiance = dr.gather( type(self.surfaceInteractionRecord.radiance), self.surfaceInteractionRecord.radiance, activeIndex )
+        # Compact the data arrays
+        rec.position = dr.gather(type(rec.position), rec.position, activeIndex)
+        rec.normal = dr.gather(type(rec.normal), rec.normal, activeIndex)
+        rec.wo = dr.gather(type(rec.wo), rec.wo, activeIndex)
+        rec.wo_world = dr.gather(type(rec.wo_world), rec.wo_world, activeIndex)
+        rec.wi = dr.gather(type(rec.wi), rec.wi, activeIndex)
+        rec.radiance = dr.gather(type(rec.radiance), rec.radiance, activeIndex)
 
         if self.isStoreNEERadiance:
-            self.surfaceInteractionRecord.radiance_nee = dr.gather( type(self.surfaceInteractionRecord.radiance_nee), self.surfaceInteractionRecord.radiance_nee, activeIndex )
-            self.surfaceInteractionRecord.direction_nee = dr.gather( type(self.surfaceInteractionRecord.direction_nee), self.surfaceInteractionRecord.direction_nee, activeIndex )
+            rec.radiance_nee = dr.gather(type(rec.radiance_nee), rec.radiance_nee, activeIndex)
+            rec.direction_nee = dr.gather(type(rec.direction_nee), rec.direction_nee, activeIndex)
         
-        self.surfaceInteractionRecord.product = dr.gather( type(self.surfaceInteractionRecord.product), self.surfaceInteractionRecord.product, activeIndex )
-        self.surfaceInteractionRecord.woPdf = dr.gather( type(self.surfaceInteractionRecord.woPdf), self.surfaceInteractionRecord.woPdf, activeIndex )
-        self.surfaceInteractionRecord.bsdfPdf = dr.gather( type(self.surfaceInteractionRecord.bsdfPdf), self.surfaceInteractionRecord.bsdfPdf, activeIndex )
-        self.surfaceInteractionRecord.isDelta = dr.gather( type(self.surfaceInteractionRecord.isDelta), self.surfaceInteractionRecord.isDelta, activeIndex )
+        rec.product = dr.gather(type(rec.product), rec.product, activeIndex)
+        rec.woPdf = dr.gather(type(rec.woPdf), rec.woPdf, activeIndex)
+        rec.bsdfPdf = dr.gather(type(rec.bsdfPdf), rec.bsdfPdf, activeIndex)
+        rec.isDelta = dr.gather(type(rec.isDelta), rec.isDelta, activeIndex)
+        
+        # Mark as scattered so we don't do it again this frame
+        self._data_scattered = True
 
 # Register new integrator
 mi.register_integrator("path_guiding_integrator", lambda props: PathGuidingIntegrator(props))
@@ -495,13 +540,13 @@ if __name__ == "__main__":
     dr.set_flag(dr.JitFlag.VCallRecord, False)
 
     import matplotlib.pyplot as plt
-    print("Initializing Integrator")
+    logger.info("Initializing Integrator")
     integrator = mi.load_dict({
         'type': 'path_guiding_integrator',
         'max_depth': 5
     })
 
-    print("Loading Scene")
+    logger.info("Loading Scene")
     scene = mi.cornell_box()
     scene['sensor']['sampler']['sample_count'] = 1
     scene['sensor']['film']['width'] = 400
@@ -520,9 +565,9 @@ if __name__ == "__main__":
         img = mi.render(scene, integrator=integrator)
         integrator.scatter_data_into_buffer()
         loss = integrator.nrc_system.train_step(integrator)
-        print(f"Loss: {loss}")
+        logger.info(f"Loss: {loss}")
 
-    print("Rendering")
+    logger.info("Rendering")
     img = mi.render(scene, integrator=integrator)
 
     plt.imshow(img ** (1. / 2.2))

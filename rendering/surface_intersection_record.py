@@ -1,8 +1,29 @@
-import mitsuba as mi
+"""Data structures for recording surface interactions during path tracing."""
+from __future__ import annotations
+
 import drjit as dr
+import mitsuba as mi
+
 
 class SurfaceInteractionRecord:
-    """ Custom data struct to hold the recordings together """
+    """Custom data struct to hold surface interaction recordings.
+    
+    This structure stores all relevant information about surface interactions
+    encountered during path tracing, used for training the guiding network.
+    
+    Attributes:
+        position: World-space position of the intersection
+        wi: Incoming direction (from camera/previous bounce)
+        wo: Outgoing direction (sampled using BSDF)
+        wo_world: Outgoing direction in world coordinates
+        normal: Surface shading normal
+        bsdf: BSDF value at the intersection
+        radiance: Incoming radiance at this vertex
+        woPdf: Combined PDF of the sampled direction
+        bsdfPdf: PDF from BSDF sampling only
+        isDelta: Whether this is a delta scattering event
+        active: Whether this lane is active
+    """
     DRJIT_STRUCT = {
         'position' : mi.Vector3f, # normalized to [-1, 1]^3?
         'wi' : mi.Vector3f, # [theta, phi] wi, where theta in [0, pi] and phi in [0, 2pi]

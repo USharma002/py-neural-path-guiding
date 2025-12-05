@@ -1,7 +1,5 @@
 import mitsuba as mi
 import drjit as dr
-from path_guiding_integrator import PathGuidingIntegrator
-from path_guiding_system import PathGuidingSystem
 import torch
 mi.set_variant("cuda_ad_rgb")
 

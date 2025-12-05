@@ -1,12 +1,11 @@
 drjit==0.4.4
-matplotlib==3.10.5
+matplotlib==3.10.7
 mitsuba==3.5.0
-numpy==2.3.2
-Pillow==11.3.0
+numba==0.62.0
+numpy==2.3.5
+Pillow==12.0.0
 plotly==6.2.0
-PyQt6==6.9.1
+PyQt6==6.10.0
 PyQt6_sip==13.10.0
-PyQt6-WebEngine
-tinycudann==1.7
 torch==2.7.1+cu126
 tqdm==4.67.0
