@@ -202,6 +202,10 @@ class VMFGuidingDistribution(GuidingDistribution):
         targets_li = batch.radiance_rgb
         combined_pdf = batch.combined_pdf
         
+        # Sanitize inputs (NaN protection)
+        if torch.isnan(wi).any() or torch.isnan(roughness).any():
+            return 0.0
+            
         self.network.train()
         
         # Forward pass - get predicted distribution
@@ -219,20 +223,33 @@ class VMFGuidingDistribution(GuidingDistribution):
         prob = dist.pdf(wo)
         epsilon = self.vmf_config.epsilon
         
+        # Sanitize combined_pdf to avoid div by zero
+        safe_combined_pdf = torch.nan_to_num(combined_pdf, nan=1.0).clamp(min=1e-6)
+        
         # Importance weight
-        importance_weight = ground_truth_radiance.detach() / (combined_pdf + epsilon)
+        importance_weight = ground_truth_radiance.detach() / safe_combined_pdf
         importance_weight = importance_weight.clamp(
             max=self.vmf_config.importance_weight_max
         )
         
         # MLE loss with importance weighting
-        log_prob = torch.log(prob + epsilon)
+        # Robust Log: clamp prob to avoid log(0) -> -inf
+        safe_prob = prob.clamp(min=1e-8)
+        log_prob = torch.log(safe_prob)
+        
         mle_loss = -importance_weight * log_prob
         
         # Kappa regularization to prevent concentration collapse
         kappa_loss = self.vmf_config.kappa_regularization_strength * torch.mean(kappas.pow(2))
         
         loss = torch.mean(mle_loss) + kappa_loss
+        
+        # --- ROBUSTNESS CHECK ---
+        if torch.isnan(loss) or torch.isinf(loss):
+            logger.warning(f"NaN Loss detected in VMF training! Max Radiance: {ground_truth_radiance.max().item():.2f}")
+            self.optimizer.zero_grad()
+            return 0.0 # Skip step
+        # ------------------------
         
         # Backward pass
         self.optimizer.zero_grad()

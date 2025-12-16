@@ -48,11 +48,11 @@ class DFConfig(GuidingConfig):
     hidden_dim: int = 64
     n_hidden_layers: int = 3
     
-    # Conditional Encoding (Paper: Triangle Wave with 12 frequencies)
+    # Conditional Encoding (Paper: Triangle Wave for epsilon_1)
     u_encoding_freqs: int = 12 
     
     # Training
-    learning_rate: float = 1e-2 # Paper: 1e-2
+    learning_rate: float = 5e-3 # Paper: 1e-2
     use_tcnn: bool = True
 
 
@@ -488,14 +488,6 @@ class DFGuidingDistribution(GuidingDistribution):
         return torch.log(self.pdf(position, wi, wo, roughness) + 1e-10)
 
     def train_step(self, batch: TrainingBatch) -> float:
-        """Train the DF distribution.
-        
-        Args:
-            batch: TrainingBatch with positions in WORLD SPACE
-            
-        Returns:
-            Loss value for this step
-        """
         if not batch.is_valid(): 
             return -1.0
         
@@ -503,13 +495,14 @@ class DFGuidingDistribution(GuidingDistribution):
         self.conditional_net.train()
         self.marginal_head.train()
         
-        # Normalize world space positions to [0, 1] for DF network
+        # Normalize world space positions to [0, 1]
         pos_normalized = self._prepare_network_input(batch.position)
         
         all_wo = batch.wo
         all_wi = batch.wi
         all_roughness = batch.roughness
-        all_radiance = batch.radiance_rgb.mean(dim=1).clamp(max=100.0)
+        # Clamp radiance harder to prevent spikes
+        all_radiance = batch.radiance_rgb.mean(dim=1).clamp(max=20.0) 
         
         total_samples = pos_normalized.shape[0]
         BATCH_SIZE = 2 * 1024 
@@ -517,6 +510,9 @@ class DFGuidingDistribution(GuidingDistribution):
         total_loss = 0.0
         num_batches = 0
         
+        jacobian_val = self._jacobian() # 4 * pi
+        log_jacobian = math.log(jacobian_val)
+
         for start_idx in range(0, total_samples, BATCH_SIZE):
             end_idx = min(start_idx + BATCH_SIZE, total_samples)
             batch_idx = indices[start_idx:end_idx]
@@ -527,32 +523,55 @@ class DFGuidingDistribution(GuidingDistribution):
             roughness = all_roughness[batch_idx].contiguous()
             radiance = all_radiance[batch_idx].contiguous().detach()
 
-            # Forward Pass
+            # --- Forward Pass ---
             context = self.context_net(pos, wi, roughness)
             uv = self._direction_to_uv(wo)
             u, v = uv[:, 0:1], uv[:, 1:2]
             
-            # Marginal
+            # 1. Marginal U (Log-Space)
             logits_u = self.marginal_head(context)
-            pdf_u_vals = self._get_density(logits_u, self.df_config.resolution_u)
-            val_u = self._eval_1d(pdf_u_vals, u, self.df_config.resolution_u, is_periodic=True)
+            log_prob_u_grid = F.log_softmax(logits_u, dim=1) + math.log(self.df_config.resolution_u)
+            prob_u_grid = torch.exp(log_prob_u_grid)
+            val_u = self._eval_1d(prob_u_grid, u, self.df_config.resolution_u, is_periodic=True)
             
-            # Conditional
+            # 2. Conditional V (Log-Space)
             u_feats = self.u_encoder(u)
             cond_input = torch.cat([context, u_feats], dim=1)
             logits_v = self.conditional_net(cond_input).float()
-            pdf_v_vals = self._get_density(logits_v, self.df_config.resolution_v)
-            val_v = self._eval_1d(pdf_v_vals, v, self.df_config.resolution_v, is_periodic=False)
             
-            # Joint
-            pdf_uv = val_u * val_v
+            log_prob_v_grid = F.log_softmax(logits_v, dim=1) + math.log(self.df_config.resolution_v)
+            prob_v_grid = torch.exp(log_prob_v_grid)
+            val_v = self._eval_1d(prob_v_grid, v, self.df_config.resolution_v, is_periodic=False)
             
-            # Loss
-            log_q = torch.log(pdf_uv.clamp(min=1e-8))
-            loss = -(radiance * log_q).mean()
+            # 3. Joint Log Probability
+            # Use log product rule: log(a * b) = log(a) + log(b)
+            # This is safer than multiplying small probabilities then logging
+            prob_uv = (val_u * val_v).clamp(min=1e-6) # Clamp to avoid log(0)
+            log_prob_uv = torch.log(prob_uv)
             
+            # Correct for Jacobian: p(w) = p(uv) / 4pi => log p(w) = log p(uv) - log(4pi)
+            log_prob_dir = log_prob_uv - log_jacobian
+            
+            # 4. Loss
+            loss = -(radiance * log_prob_dir).mean()
+            
+            # --- Optimization with Safety Checks ---
             self.optimizer.zero_grad()
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"NaN Loss detected! Skipping batch. (Radiance Max: {radiance.max()})")
+                continue # Skip this bad batch
+                
             loss.backward()
+            
+            # Clip Gradients globally (all parameters)
+            all_params = (
+                list(self.context_net.parameters()) + 
+                list(self.marginal_head.parameters()) + 
+                list(self.conditional_net.parameters())
+            )
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            
             self.optimizer.step()
             
             total_loss += loss.item()
