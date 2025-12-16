@@ -1,0 +1,322 @@
+
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Comparison</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; height: 100vh; overflow: hidden; background: #0d0d0d; color: #e0e0e0; user-select: none; }
+            
+            /* Sidebar */
+            #sidebar { width: 280px; background: #161616; display: flex; flex-direction: column; border-right: 1px solid #333; z-index: 20; }
+            .sidebar-header { padding: 18px 20px; border-bottom: 1px solid #333; font-weight:700; font-size:1.1em; letter-spacing:0.5px; color:#fff; background: #1a1a1a; }
+            .method-list { flex: 1; overflow-y: auto; padding: 10px; }
+            .method-item { padding: 12px 16px; margin-bottom: 4px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; background: transparent; border-left: 3px solid transparent; transition: background 0.15s; font-size: 0.9em; }
+            .method-item:hover { background: #222; }
+            .method-item.active { background: #262626; border-left-color: #7952b3; color: #fff; font-weight: 500; }
+            .method-item.reference { border-left-color: #2da44e; } 
+            .method-item.reference.active { background: #1a2e20; }
+            
+            #content { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; }
+            
+            /* Header Tabs */
+            .header-bar { height: 48px; background: #161616; display: flex; align-items: center; padding: 0 20px; border-bottom: 1px solid #333; gap: 20px; }
+            .metric-tab { height: 100%; display: flex; align-items: center; cursor: pointer; color: #888; border-bottom: 3px solid transparent; font-size: 0.9em; font-weight: 500; transition: 0.2s; padding: 0 5px; }
+            .metric-tab:hover { color: #ccc; }
+            .metric-tab.active { color: #fff; border-bottom-color: #7952b3; }
+            
+            /* Viewport */
+            #viewport-container { flex: 1; position: relative; background: #050505; overflow: hidden; cursor: grab; }
+            #viewport-container:active { cursor: grabbing; }
+            #image-wrapper { position: absolute; top: 0; left: 0; transform-origin: 0 0; will-change: transform; }
+            #display-img { display: block; pointer-events: none; image-rendering: -webkit-optimize-contrast; } 
+            
+            /* Bottom Patch Inspector */
+            #inspector { height: 160px; background: #121212; border-top: 1px solid #333; display: flex; overflow-x: auto; padding: 12px; gap: 12px; scrollbar-width: thin; scrollbar-color: #444 #121212; }
+            .insp-card { flex: 0 0 160px; display: flex; flex-direction: column; background: #000; border: 1px solid #333; border-radius: 6px; overflow: hidden; cursor: pointer; transition: 0.2s; }
+            .insp-card.active { border-color: #7952b3; box-shadow: 0 0 0 1px #7952b3; }
+            .insp-view { flex: 1; background-repeat: no-repeat; background-color: #000; }
+            .insp-label { padding: 8px; font-size: 0.75em; color: #aaa; background: #1a1a1a; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-top: 1px solid #222; }
+            
+            /* Stats Table */
+            #stats-container { flex: 1; overflow: auto; padding: 40px; background: #0d0d0d; display: none; }
+            table { width: 100%; max-width: 1200px; border-collapse: collapse; font-size: 0.9em; color: #ccc; margin-bottom: 50px; }
+            th { text-align: left; padding: 12px 15px; border-bottom: 2px solid #444; color: #888; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.5px; position: sticky; top: 0; background: #0d0d0d; }
+            td { padding: 12px 15px; border-bottom: 1px solid #222; font-variant-numeric: tabular-nums; }
+            tr:hover td { background: #161616; }
+            .val-best { color: #a285d6; font-weight: 700; }
+            
+            /* Message Overlay */
+            #status-overlay {
+                position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                background: rgba(18, 18, 18, 0.9); color: #ddd; padding: 25px 40px; 
+                border-radius: 12px; text-align: center; font-size: 1em; 
+                backdrop-filter: blur(8px); border: 1px solid #333;
+                pointer-events: none; display: none; z-index: 50; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            }
+            #status-overlay strong { display: block; color: #fff; font-size: 1.2em; margin-bottom: 8px; }
+        </style>
+    </head>
+    <body>
+        <div id="sidebar">
+            <div class="sidebar-header">Comparison</div>
+            <div class="method-list" id="method-list"></div>
+        </div>
+        <div id="content">
+            <div class="header-bar">
+                <div class="metric-tab active" onclick="setView('render')">Render</div>
+                <div class="metric-tab" onclick="setView('variance')">Variance</div>
+                <div class="metric-tab" onclick="setView('mape')">MAPE</div>
+                <div class="metric-tab" onclick="setView('relmse')">RelMSE</div>
+                <div class="metric-tab" onclick="setView('stats')">Statistics</div>
+            </div>
+            
+            <div id="viewport-container">
+                <div id="status-overlay"></div>
+                <div id="image-wrapper"><img id="display-img" src="" draggable="false" /></div>
+            </div>
+            
+            <div id="stats-container">
+                <h2 style="color:white; margin-top:0; margin-bottom:20px; font-weight:500;">Quantitative Metrics</h2>
+                <div id="stats-content"></div>
+            </div>
+
+            <div id="inspector"></div>
+        </div>
+        <script>
+            const STATIC_DATA = {"methods": [{"name": "Ground Truth", "folder": "gt-render-10000", "isRef": true, "metrics": {"MSE": 0.0, "RelMSE": 0.0, "MAPE": 0.0, "Var_Mean": 1.253695011138916, "Var_Median": 0.34811466932296753, "Var_Max": 51.549259185791016, "Var_Min": 0.0}, "images": {"render": "assets/gt_render_10000/view_rgb.png", "variance": "assets/gt_render_10000/view_variance.png", "mape": "assets/gt_render_10000/view_mape.png", "relmse": "assets/gt_render_10000/view_relmse.png"}}, {"name": "Baseline (Unguided)", "folder": "unguided-render-1000", "isRef": false, "metrics": {"MSE": 0.0013235684018582106, "RelMSE": 0.11262612789869308, "MAPE": 0.3476073145866394, "Var_Mean": 1.2532809972763062, "Var_Median": 0.30579477548599243, "Var_Max": 54.04167556762695, "Var_Min": 0.0}, "images": {"render": "assets/unguided_render_1000/view_rgb.png", "variance": "assets/unguided_render_1000/view_variance.png", "mape": "assets/unguided_render_1000/view_mape.png", "relmse": "assets/unguided_render_1000/view_relmse.png"}}, {"name": "Df Render 1000", "folder": "df-render-1000", "isRef": false, "metrics": {"MSE": 0.0007238105172291398, "RelMSE": 0.04590446501970291, "MAPE": 0.20884348452091217, "Var_Mean": 0.6288372874259949, "Var_Median": 0.0698147863149643, "Var_Max": 56.229312896728516, "Var_Min": 0.0}, "images": {"render": "assets/df_render_1000/view_rgb.png", "variance": "assets/df_render_1000/view_variance.png", "mape": "assets/df_render_1000/view_mape.png", "relmse": "assets/df_render_1000/view_relmse.png"}}, {"name": "Vmf Render 1000", "folder": "vmf-render-1000", "isRef": false, "metrics": {"MSE": 0.0006172606372274458, "RelMSE": 0.041430119425058365, "MAPE": 0.20767521858215332, "Var_Mean": 0.5404930710792542, "Var_Median": 0.09068740159273148, "Var_Max": 38.25148391723633, "Var_Min": 0.0}, "images": {"render": "assets/vmf_render_1000/view_rgb.png", "variance": "assets/vmf_render_1000/view_variance.png", "mape": "assets/vmf_render_1000/view_mape.png", "relmse": "assets/vmf_render_1000/view_relmse.png"}}]};
+            
+            let state = { view: 'render', currentIdx: 0, methods: [], imgW: 0, imgH: 0 };
+            let transform = { x: 0, y: 0, scale: 1 };
+            let isDragging = false, startPan = { x: 0, y: 0 };
+
+            function init() {
+                state.methods = STATIC_DATA.methods;
+                renderSidebar();
+                renderInspector();
+                if(state.methods.length > 0) setMethod(0);
+                setupInteractions();
+            }
+
+            function setupInteractions() {
+                const container = document.getElementById('viewport-container');
+                const img = document.getElementById('display-img');
+                
+                img.onload = () => {
+                    state.imgW = img.naturalWidth; state.imgH = img.naturalHeight;
+                    if(transform.scale === 1 && state.imgW > 0) {
+                        const cw = container.clientWidth, ch = container.clientHeight;
+                        const scale = Math.min(cw/state.imgW, ch/state.imgH) * 0.9;
+                        transform.scale = scale;
+                        transform.x = (cw - state.imgW * scale) / 2;
+                        transform.y = (ch - state.imgH * scale) / 2;
+                        applyTransform();
+                    }
+                    updateInspectorZoom();
+                };
+
+                container.addEventListener('wheel', (e) => {
+                    e.preventDefault();
+                    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+                    const newScale = transform.scale * delta;
+                    const rect = container.getBoundingClientRect();
+                    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+                    
+                    transform.x -= (mx - transform.x) * (delta - 1);
+                    transform.y -= (my - transform.y) * (delta - 1);
+                    transform.scale = newScale;
+                    applyTransform();
+                    handleHover(e);
+                });
+                
+                container.addEventListener('mousedown', (e) => { isDragging = true; startPan = { x: e.clientX - transform.x, y: e.clientY - transform.y }; });
+                window.addEventListener('mouseup', () => isDragging = false);
+                window.addEventListener('mousemove', (e) => {
+                    if(isDragging) { transform.x = e.clientX - startPan.x; transform.y = e.clientY - startPan.y; applyTransform(); }
+                    const vRect = container.getBoundingClientRect();
+                    if(e.clientX >= vRect.left && e.clientX <= vRect.right && e.clientY >= vRect.top && e.clientY <= vRect.bottom) handleHover(e, vRect);
+                });
+            }
+
+            function applyTransform() { document.getElementById('image-wrapper').style.transform = `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`; }
+            
+            function handleHover(e, containerRect) {
+                if(state.imgW === 0) return;
+                if(!containerRect) containerRect = document.getElementById('viewport-container').getBoundingClientRect();
+                const mx = e.clientX - containerRect.left, my = e.clientY - containerRect.top;
+                
+                const imgX = (mx - transform.x) / transform.scale;
+                const imgY = (my - transform.y) / transform.scale;
+                
+                const centerOffX = 150/2; 
+                const centerOffY = 150/2;
+                const bgX = centerOffX - imgX;
+                const bgY = centerOffY - imgY;
+                
+                document.querySelectorAll('.insp-view').forEach(el => { 
+                    if(el.style.backgroundImage && el.style.backgroundImage !== 'none') {
+                        el.style.backgroundPosition = `${bgX}px ${bgY}px`; 
+                    }
+                });
+            }
+            
+            function updateInspectorZoom() { 
+                document.querySelectorAll('.insp-view').forEach(el => { 
+                    if(el.style.backgroundImage && el.style.backgroundImage !== 'none') {
+                        el.style.backgroundSize = `${state.imgW}px ${state.imgH}px`; 
+                    }
+                }); 
+            }
+
+            function setView(v) {
+                state.view = v;
+                document.querySelectorAll('.metric-tab').forEach(el => el.classList.remove('active'));
+                const map = {'render': 'Render', 'variance': 'Variance', 'mape': 'MAPE', 'relmse': 'RelMSE', 'stats': 'Statistics'};
+                Array.from(document.querySelectorAll('.metric-tab')).find(el => el.innerText.includes(map[v])).classList.add('active');
+
+                if(v === 'stats') {
+                    document.getElementById('viewport-container').style.display = 'none';
+                    document.getElementById('inspector').style.display = 'none';
+                    document.getElementById('stats-container').style.display = 'block';
+                    renderStatsTable();
+                } else {
+                    document.getElementById('viewport-container').style.display = 'block';
+                    document.getElementById('inspector').style.display = 'flex';
+                    document.getElementById('stats-container').style.display = 'none';
+                    refreshImages();
+                }
+            }
+
+            function setMethod(idx) {
+                state.currentIdx = idx;
+                document.querySelectorAll('.method-item, .insp-card').forEach(el => el.classList.remove('active'));
+                
+                document.getElementById(`m-item-${idx}`).classList.add('active');
+                document.getElementById(`insp-${idx}`).classList.add('active');
+                
+                if(state.view !== 'stats') refreshImages();
+            }
+            
+            function getImagePath(methodIdx, viewType) {
+                const m = state.methods[methodIdx];
+                if(!m || !m.images) return null;
+                return m.images[viewType];
+            }
+
+            function refreshImages() {
+                const dispImg = document.getElementById('display-img');
+                const overlay = document.getElementById('status-overlay');
+                const method = state.methods[state.currentIdx];
+                const imgPath = getImagePath(state.currentIdx, state.view);
+                
+                const isErrorView = ['mape', 'relmse'].includes(state.view);
+                
+                if (method.isRef && isErrorView) {
+                    overlay.style.display = 'block';
+                    overlay.innerHTML = "<strong>Reference (Ground Truth)</strong>Error is zero by definition.";
+                    if(imgPath) dispImg.src = imgPath;
+                    else dispImg.style.display = 'none';
+                } 
+                else if (!imgPath) {
+                    overlay.style.display = 'block';
+                    overlay.innerHTML = "<strong>Visualization Not Available</strong>No data found for this view.";
+                    dispImg.style.display = 'none';
+                }
+                else {
+                    overlay.style.display = 'none';
+                    dispImg.src = imgPath;
+                    dispImg.style.display = 'block';
+                }
+
+                state.methods.forEach((m, i) => {
+                    const el = document.querySelector(`#insp-${i} .insp-view`);
+                    const thumbPath = getImagePath(i, state.view);
+                    if(el) {
+                        if(thumbPath) el.style.backgroundImage = `url('${thumbPath}')`;
+                        else el.style.backgroundImage = 'none';
+                    }
+                });
+                
+                if(state.imgW > 0) updateInspectorZoom();
+            }
+
+            function renderSidebar() {
+                const list = document.getElementById('method-list');
+                list.innerHTML = state.methods.map((m, i) => `
+                    <div class="method-item ${m.isRef ? 'reference' : ''}" id="m-item-${i}" onclick="setMethod(${i})">
+                        <div class="method-name">${m.name}</div>
+                    </div>
+                `).join('');
+            }
+
+            function renderInspector() {
+                const cont = document.getElementById('inspector');
+                cont.innerHTML = state.methods.map((m, i) => `
+                    <div class="insp-card" id="insp-${i}" onclick="setMethod(${i})">
+                        <div class="insp-view"></div>
+                        <div class="insp-label">${m.name}</div>
+                    </div>
+                `).join('');
+            }
+
+            function renderStatsTable() {
+                const container = document.getElementById('stats-content');
+                const columns = [
+                    { key: 'MSE', name: 'MSE', better: 'low' },
+                    { key: 'RelMSE', name: 'RelMSE', better: 'low' },
+                    { key: 'Var_Mean', name: 'Var (Mean)', better: 'low' },
+                    { key: 'Var_Median', name: 'Var (Med)', better: 'low' },
+                    { key: 'Var_Max', name: 'Var (Max)', better: 'low' }
+                ];
+                
+                // FILTER: Exclude Reference from table calculation
+                const validMethods = state.methods.filter(m => !m.isRef);
+
+                const bests = {};
+                columns.forEach(col => {
+                    let bestVal = col.better === 'high' ? -Infinity : Infinity;
+                    validMethods.forEach(m => {
+                        if(m.metrics && m.metrics[col.key] !== undefined && m.metrics[col.key] !== "N/A") {
+                            const v = parseFloat(m.metrics[col.key]);
+                            if(col.better === 'high') { if(v > bestVal) bestVal = v; } 
+                            else { if(v < bestVal) bestVal = v; }
+                        }
+                    });
+                    bests[col.key] = bestVal;
+                });
+
+                let html = `<table><thead><tr><th>Method</th>`;
+                columns.forEach(c => html += `<th>${c.name}</th>`);
+                html += `</tr></thead><tbody>`;
+
+                validMethods.forEach(m => {
+                    html += `<tr><td style="font-weight:600; color:#eee;">${m.name}</td>`;
+                    columns.forEach(c => {
+                        if(!m.metrics || m.metrics[c.key] === undefined || m.metrics[c.key] === "N/A") {
+                            html += `<td style="color:#555;">-</td>`;
+                        } else {
+                            let val = parseFloat(m.metrics[c.key]);
+                            let isBest = Math.abs(val - bests[c.key]) < 0.000001;
+                            let style = isBest ? 'class="val-best"' : '';
+                            let str = val.toFixed(6);
+                            if(c.key === 'PSNR') str = val.toFixed(2);
+                            if(c.key.includes('Var')) str = val.toExponential(2);
+                            html += `<td ${style}>${str}</td>`;
+                        }
+                    });
+                    html += `</tr>`;
+                });
+                html += `</tbody></table>`;
+                
+                if (validMethods.length === 0) {
+                    container.innerHTML = "<p style='color:#888'>No methods available for comparison.</p>";
+                } else {
+                    container.innerHTML = html;
+                }
+            }
+
+            init();
+        </script>
+    </body>
+    </html>
+    
