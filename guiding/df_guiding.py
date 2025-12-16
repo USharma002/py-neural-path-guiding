@@ -7,11 +7,14 @@ Key Features:
 - Factorization: p(u, v) = p(u) * p(v|u)
 - Mapping: Area-preserving square-to-sphere mapping (Uniform Jacobian).
 - Encodings: SH for direction, OneBlob for roughness, Triangle Wave for conditional.
+
+All public methods accept WORLD SPACE positions and normalize internally.
+Network expects positions in [0, 1]^3 range for grid encoding.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, Optional, Literal
+from typing import Tuple, Optional, Literal, Any
 import math
 
 import torch
@@ -63,13 +66,8 @@ class TriangleWaveEncoding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x in [0, 1]
-        # T_k(x) = | 2(2^k x mod 1) - 1 |
-        # In PyTorch: triangle_wave(v) = 2 * abs(v - floor(v + 0.5)) ? 
-        # Or simply: abs(2 * (x * freq % 1) - 1)
-        
-        # x: [B, 1] -> [B, n_freqs]
+        # Triangle wave: abs(2 * (x * freq % 1) - 1)
         scaled = x * self.freqs
-        # Triangle wave in range [-1, 1]
         val = 2.0 * torch.abs(2.0 * (scaled - torch.floor(scaled + 0.5))) - 1.0
         return val
 
@@ -81,6 +79,8 @@ class ContextEncoder(nn.Module):
     - Position: Learnable Dense Grid (We use HashGrid as efficient equivalent)
     - Direction: Spherical Harmonics (Degree 4)
     - Roughness: OneBlob (4 bins)
+    
+    Expects position in [0, 1]^3 range.
     """
     def __init__(self, output_dim: int = 64, use_tcnn: bool = True):
         super().__init__()
@@ -125,6 +125,7 @@ class ContextEncoder(nn.Module):
                 encoding_config=config["encoding"],
                 network_config=config["network"]
             )
+            self.use_tcnn = True
         else:
             # Fallback (Simpler MLP)
             self.net = nn.Sequential(
@@ -133,18 +134,32 @@ class ContextEncoder(nn.Module):
                 nn.Linear(64, 64), nn.ReLU(),
                 nn.Linear(64, output_dim)
             )
+            self.use_tcnn = False
             
     def forward(self, pos, dir, rough):
-        if rough.ndim == 1: rough = rough.unsqueeze(1)
-        # Ensure inputs are in valid ranges for encodings
-        # Pos is assumed normalized to [0,1] or bound
-        # Dir should be normalized
-        # Rough in [0,1]
+        if rough.ndim == 1: 
+            rough = rough.unsqueeze(1)
+        
+        # Ensure inputs are in valid ranges
+        pos = pos.clamp(0.0, 1.0)  # Position in [0, 1]
+        dir = F.normalize(dir, dim=-1)  # Direction normalized
+        rough = rough.clamp(0.0, 1.0)  # Roughness in [0, 1]
+        
         x = torch.cat([pos, dir, rough], dim=1)
+        
+        if self.use_tcnn:
+            x = x.contiguous()
+            
         return self.net(x).float()
 
 
 class DFGuidingDistribution(GuidingDistribution):
+    """Distribution Factorization path guiding.
+    
+    All public methods accept WORLD SPACE positions and normalize internally.
+    Network requires positions in [0, 1]^3 for grid encoding.
+    """
+    
     def __init__(self, config: Optional[DFConfig] = None):
         config = config or DFConfig()
         super().__init__(config)
@@ -152,20 +167,18 @@ class DFGuidingDistribution(GuidingDistribution):
         
         # 1. Context Encoder
         self.context_net = ContextEncoder(
-            output_dim=config.hidden_dim, # Context feature size
+            output_dim=config.hidden_dim,
             use_tcnn=config.use_tcnn
         ).to(self.device)
         
         # 2. U-Encoding (Triangle Wave for conditional input)
         self.u_encoder = TriangleWaveEncoding(n_frequencies=config.u_encoding_freqs).to(self.device)
-        u_feat_dim = config.u_encoding_freqs # Triangle wave output size
+        u_feat_dim = config.u_encoding_freqs
         
         # 3. PDF Estimators (Heads)
-        # Marginal Head: Context(64) -> M1
         self.marginal_head = nn.Linear(config.hidden_dim, config.resolution_u).to(self.device)
         
-        # Conditional Head: Context(64) + U_Feats(12) -> MLP -> M2
-        # The paper uses a small network for the conditional part taking context+u
+        # Conditional Head
         cond_input_dim = config.hidden_dim + u_feat_dim
         
         if config.use_tcnn and TCNN_AVAILABLE:
@@ -174,7 +187,7 @@ class DFGuidingDistribution(GuidingDistribution):
                 n_output_dims=config.resolution_v,
                 network_config={
                     "otype": "FullyFusedMLP", "activation": "ReLU", "output_activation": "None",
-                    "n_neurons": config.hidden_dim, "n_hidden_layers": 2 # Slightly smaller head
+                    "n_neurons": config.hidden_dim, "n_hidden_layers": 2
                 }
             ).to(self.device)
         else:
@@ -199,6 +212,29 @@ class DFGuidingDistribution(GuidingDistribution):
     def name(self) -> str:
         return f"DF-{self.df_config.interpolation_mode[0].upper()}"
 
+    def _prepare_network_input(self, position: torch.Tensor) -> torch.Tensor:
+        """Convert world-space position to DF network input format [0, 1]^3.
+        
+        DF network expects positions normalized to [0, 1]^3 range for HashGrid encoding.
+        
+        Args:
+            position: (N, 3) world-space positions
+            
+        Returns:
+            (N, 3) normalized positions in [0, 1]^3
+        """
+        if self.bbox_min is None or self.bbox_max is None:
+            raise RuntimeError(
+                f"{self.name}: Scene bbox not set. Call set_scene() first."
+            )
+        
+        # Normalize to [0, 1] using scene bbox
+        extent = self.bbox_max - self.bbox_min
+        extent = torch.where(extent < 1e-6, torch.ones_like(extent), extent)
+        pos_01 = (position - self.bbox_min) / extent
+        
+        return pos_01
+
     # =========================================================================
     #  Mapping Logic (Paper: Area Preserving)
     # =========================================================================
@@ -216,17 +252,13 @@ class DFGuidingDistribution(GuidingDistribution):
         phi = torch.atan2(y, x)
         u = (phi + torch.pi) / (2 * torch.pi) # epsilon_1
         
-        # Theta: z = cos(theta). 
-        # We want v (epsilon_2) such that z = 1 - 2v  =>  2v = 1 - z  => v = (1 - z) / 2
-        # z in [-1, 1]. if z=1 (pole), v=0. if z=-1, v=1.
+        # Z -> V: z = 1 - 2v  =>  v = (1 - z) / 2
         v = (1.0 - z) / 2.0
         
         return torch.stack([u, v], dim=1).clamp(0.0, 1.0)
 
     def _uv_to_direction(self, uv: torch.Tensor) -> torch.Tensor:
-        """
-        Inverse of above.
-        """
+        """Inverse of above."""
         u, v = uv[:, 0], uv[:, 1]
         
         # Phi
@@ -235,8 +267,7 @@ class DFGuidingDistribution(GuidingDistribution):
         # Z
         z = 1.0 - 2.0 * v
         
-        # Sin theta (for x, y)
-        # sin^2 + cos^2 = 1 => sin = sqrt(1 - z^2)
+        # Sin theta
         sin_theta = torch.sqrt((1.0 - z**2).clamp(min=0.0))
         
         x = sin_theta * torch.cos(phi)
@@ -248,7 +279,6 @@ class DFGuidingDistribution(GuidingDistribution):
         """
         For the area preserving mapping:
         d_omega = 4 * pi * du * dv
-        p(omega) = p(u, v) / (4 * pi)
         Jacobian is constant 4 * pi.
         """
         return 4 * torch.pi
@@ -258,225 +288,289 @@ class DFGuidingDistribution(GuidingDistribution):
     # =========================================================================
 
     def _get_density(self, logits: torch.Tensor, M: int) -> torch.Tensor:
-        # Softmax to probs, multiply by M to get density
+        """Convert logits to density via softmax."""
         return M * F.softmax(logits, dim=1)
 
-    def _eval_1d(self, density: torch.Tensor, coords: torch.Tensor, M: int) -> torch.Tensor:
-        # coords in [0, 1]
+    def _eval_1d(self, density: torch.Tensor, coords: torch.Tensor, M: int, is_periodic: bool = False) -> torch.Tensor:
+        """
+        Evaluates the PDF at specific coordinates [0, 1].
+        Handles periodic (U) and clamped (V) boundaries.
+        """
         if self.df_config.interpolation_mode == "nearest":
             idx = (coords * M).long().clamp(0, M - 1)
             return torch.gather(density, 1, idx)
         else:
-            # Linear (DF-L)
-            # Center of bin i is at (i + 0.5) / M
-            m = coords * M - 0.5
-            idx_floor = torch.floor(m).long().clamp(0, M - 1)
-            idx_ceil = (idx_floor + 1).clamp(0, M - 1)
-            alpha = (m - torch.floor(m)).clamp(0, 1)
+            # Linear interpolation
+            m = coords * M
+            idx_floor = torch.floor(m).long()
+
+            if is_periodic:
+                # Wrap indices for periodic dimension (U/phi)
+                idx_l = idx_floor % M
+                idx_r = (idx_floor + 1) % M
+            else:
+                # Clamp indices for non-periodic dimension (V/theta)
+                idx_l = idx_floor.clamp(0, M - 1)
+                idx_r = (idx_floor + 1).clamp(0, M - 1)
             
-            val_l = torch.gather(density, 1, idx_floor)
-            val_r = torch.gather(density, 1, idx_ceil)
+            # Local coordinate
+            alpha = (m - idx_floor).clamp(0, 1)
+            
+            val_l = torch.gather(density, 1, idx_l)
+            val_r = torch.gather(density, 1, idx_r)
+            
             return (1 - alpha) * val_l + alpha * val_r
 
-    def _sample_1d(self, density: torch.Tensor, rand: torch.Tensor, M: int) -> torch.Tensor:
+    def _sample_1d(self, density: torch.Tensor, rand: torch.Tensor, M: int, is_periodic: bool = False) -> torch.Tensor:
+        """Inverse Transform Sampling for Piecewise Linear distributions."""
         B = density.shape[0]
         
-        # Construct CDF
-        if self.df_config.interpolation_mode == "nearest":
-            # Piecewise constant -> Linear CDF
-            areas = density * (1.0 / M)
-            cdf = torch.cumsum(areas, dim=1)
-            cdf = cdf / (cdf[:, -1:] + 1e-8)
-            cdf_full = torch.cat([torch.zeros(B, 1, device=self.device), cdf], dim=1)
-            
-            idx = torch.searchsorted(cdf_full, rand) - 1
-            idx = idx.clamp(0, M - 1)
-            
-            cdf_lo = torch.gather(cdf_full, 1, idx)
-            cdf_hi = torch.gather(cdf_full, 1, idx+1)
-            local_u = (rand - cdf_lo) / (cdf_hi - cdf_lo + 1e-8)
-            return (idx + local_u.clamp(0,1)) / M
-            
+        # 1. Construct Vertex Pairs
+        v_curr = density
+        if is_periodic:
+            v_next = torch.cat([density[:, 1:], density[:, 0:1]], dim=1)
         else:
-            # Piecewise linear -> Quadratic CDF
-            # Trapezoids between bin centers (Simplified DF-L sampling)
-            v_curr = density
             v_next = torch.cat([density[:, 1:], density[:, -1:]], dim=1)
             
-            bin_width = 1.0 / M
-            areas = 0.5 * (v_curr + v_next) * bin_width
-            cdf = torch.cumsum(areas, dim=1)
-            cdf = cdf / (cdf[:, -1:] + 1e-8)
-            cdf_full = torch.cat([torch.zeros(B, 1, device=self.device), cdf], dim=1)
-            
-            idx = torch.searchsorted(cdf_full, rand) - 1
-            idx = idx.clamp(0, M - 1)
-            
-            # Quadratic solve
-            cdf_lo = torch.gather(cdf_full, 1, idx)
-            y0 = torch.gather(v_curr, 1, idx)
-            y1 = torch.gather(v_next, 1, idx)
-            delta = y1 - y0
-            
-            target = rand - cdf_lo
-            
-            # Area(t) = width * (y0*t + 0.5*delta*t^2)
-            # We solve for normalized t in [0,1]
-            # Since we are in normalized CDF space, we scale by bin_area
-            bin_area = torch.gather(cdf_full, 1, idx+1) - cdf_lo
-            frac = target / (bin_area + 1e-10) # 0..1
-            
-            # (y0*t + 0.5*delta*t^2) / (y0 + 0.5*delta) = frac
-            A = 0.5 * delta
-            B = y0
-            C = -frac * (y0 + 0.5 * delta)
-            
-            det = (B**2 - 4*A*C).clamp(min=0)
-            sqrt_det = torch.sqrt(det)
-            
-            t_quad = (-B + sqrt_det) / (2*A + 1e-10)
-            t_lin = -C / (B + 1e-10)
-            
-            is_lin = torch.abs(A) < 1e-5
-            t = torch.where(is_lin, t_lin, t_quad).clamp(0, 1)
-            
-            return (idx + t) / M
+        # 2. Build CDF
+        bin_width = 1.0 / M
+        areas = 0.5 * (v_curr + v_next) * bin_width
+        cdf = torch.cumsum(areas, dim=1)
+        
+        total_area = cdf[:, -1:]
+        cdf = cdf / (total_area + 1e-8)
+        
+        cdf_full = torch.cat([torch.zeros(B, 1, device=self.device), cdf], dim=1)
+        
+        # 3. Find Bin Index
+        idx = torch.searchsorted(cdf_full, rand) - 1
+        idx = idx.clamp(0, M - 1)
+        
+        # 4. Invert Quadratic
+        cdf_lo = torch.gather(cdf_full, 1, idx)
+        target_norm = rand - cdf_lo
+        bin_area_norm = torch.gather(cdf_full, 1, idx+1) - cdf_lo
+        
+        frac = target_norm / (bin_area_norm + 1e-10)
+        
+        y0 = torch.gather(v_curr, 1, idx)
+        y1 = torch.gather(v_next, 1, idx)
+        delta = y1 - y0
+        
+        A = 0.5 * delta
+        B_coef = y0
+        C = -frac * (y0 + 0.5 * delta)
+        
+        det = (B_coef**2 - 4*A*C).clamp(min=0)
+        sqrt_det = torch.sqrt(det)
+        
+        t_quad = (-B_coef + sqrt_det) / (2*A + 1e-10)
+        t_lin = -C / (B_coef + 1e-10)
+        
+        is_lin = torch.abs(A) < 1e-5
+        t = torch.where(is_lin, t_lin, t_quad).clamp(0, 1)
+        
+        return (idx + t) / M
 
     # =========================================================================
     #  Main Interface
     # =========================================================================
 
     def sample(self, position, wi, roughness):
+        """Sample directions from the DF distribution.
+        
+        Args:
+            position: (N, 3) positions in WORLD SPACE
+            wi: (N, 3) incoming directions
+            roughness: (N, 1) surface roughness
+            
+        Returns:
+            Tuple of:
+            - directions: (N, 3) sampled unit vectors
+            - pdf_values: (N,) probability densities
+        """
         self.context_net.eval()
         self.conditional_net.eval()
+        self.marginal_head.eval()
         
         B = position.shape[0]
+        
+        # Normalize world space -> [0, 1] for DF network
+        pos_normalized = self._prepare_network_input(position)
+        
         with torch.no_grad():
-            # 1. Context
-            context = self.context_net(position, wi, roughness) # [B, 64]
+            # 1. Context Features
+            context = self.context_net(pos_normalized, wi, roughness)
             
-            # 2. Sample U (Marginal)
+            # 2. Sample U (Marginal) - Periodic (Phi)
             logits_u = self.marginal_head(context)
             pdf_u_vals = self._get_density(logits_u, self.df_config.resolution_u)
             
             rand_u = torch.rand(B, 1, device=self.device)
-            u_samples = self._sample_1d(pdf_u_vals, rand_u, self.df_config.resolution_u)
+            u_samples = self._sample_1d(pdf_u_vals, rand_u, self.df_config.resolution_u, is_periodic=True)
             
-            # 3. Sample V (Conditional)
-            # Encode U for conditional net
-            u_feats = self.u_encoder(u_samples) # [B, 12]
+            # 3. Sample V (Conditional) - Clamped (Theta)
+            u_feats = self.u_encoder(u_samples)
             cond_input = torch.cat([context, u_feats], dim=1)
             
             logits_v = self.conditional_net(cond_input).float()
             pdf_v_vals = self._get_density(logits_v, self.df_config.resolution_v)
             
             rand_v = torch.rand(B, 1, device=self.device)
-            v_samples = self._sample_1d(pdf_v_vals, rand_v, self.df_config.resolution_v)
+            v_samples = self._sample_1d(pdf_v_vals, rand_v, self.df_config.resolution_v, is_periodic=False)
             
             # 4. Combine
             uv = torch.cat([u_samples, v_samples], dim=1)
             directions = self._uv_to_direction(uv)
             
             # 5. PDF Calculation
-            val_u = self._eval_1d(pdf_u_vals, u_samples, self.df_config.resolution_u)
-            val_v = self._eval_1d(pdf_v_vals, v_samples, self.df_config.resolution_v)
+            val_u = self._eval_1d(pdf_u_vals, u_samples, self.df_config.resolution_u, is_periodic=True)
+            val_v = self._eval_1d(pdf_v_vals, v_samples, self.df_config.resolution_v, is_periodic=False)
             
             pdf_uv = val_u * val_v
-            
-            # Jacobian correction
-            # p(omega) = p(uv) / 4pi
             pdf_dir = pdf_uv / self._jacobian()
             
             return directions, pdf_dir.squeeze()
 
     def pdf(self, position, wi, wo, roughness):
+        """Evaluate PDF for given directions.
+        
+        Args:
+            position: (N, 3) positions in WORLD SPACE
+            wi: (N, 3) incoming directions
+            wo: (N, 3) outgoing directions to evaluate
+            roughness: (N, 1) surface roughness
+            
+        Returns:
+            (N,) probability density values
+        """
         self.context_net.eval()
         self.conditional_net.eval()
+        self.marginal_head.eval()
+        
+        # Normalize world space -> [0, 1] for DF network
+        pos_normalized = self._prepare_network_input(position)
         
         with torch.no_grad():
-            context = self.context_net(position, wi, roughness)
+            context = self.context_net(pos_normalized, wi, roughness)
             uv = self._direction_to_uv(wo)
             u, v = uv[:, 0:1], uv[:, 1:2]
             
             # Marginal U
             logits_u = self.marginal_head(context)
             pdf_u_vals = self._get_density(logits_u, self.df_config.resolution_u)
-            val_u = self._eval_1d(pdf_u_vals, u, self.df_config.resolution_u)
+            val_u = self._eval_1d(pdf_u_vals, u, self.df_config.resolution_u, is_periodic=True)
             
             # Conditional V
             u_feats = self.u_encoder(u)
             cond_input = torch.cat([context, u_feats], dim=1)
             logits_v = self.conditional_net(cond_input).float()
             pdf_v_vals = self._get_density(logits_v, self.df_config.resolution_v)
-            val_v = self._eval_1d(pdf_v_vals, v, self.df_config.resolution_v)
+            val_v = self._eval_1d(pdf_v_vals, v, self.df_config.resolution_v, is_periodic=False)
             
             pdf_uv = val_u * val_v
             pdf_dir = pdf_uv / self._jacobian()
             
             return pdf_dir.squeeze()
 
-    def train_step(self, batch: TrainingBatch) -> float:
-        if not batch.is_valid():
-            return -1.0
+    def log_pdf(self, position, wi, wo, roughness):
+        """Evaluate log PDF for given directions.
+        
+        Args:
+            position: (N, 3) positions in WORLD SPACE
+            wi: (N, 3) incoming directions
+            wo: (N, 3) outgoing directions to evaluate
+            roughness: (N, 1) surface roughness
             
+        Returns:
+            (N,) log probability density values
+        """
+        return torch.log(self.pdf(position, wi, wo, roughness) + 1e-10)
+
+    def train_step(self, batch: TrainingBatch) -> float:
+        """Train the DF distribution.
+        
+        Args:
+            batch: TrainingBatch with positions in WORLD SPACE
+            
+        Returns:
+            Loss value for this step
+        """
+        if not batch.is_valid(): 
+            return -1.0
+        
         self.context_net.train()
         self.conditional_net.train()
         self.marginal_head.train()
         
-        # Data
-        pos = batch.position_normalized # [0,1]
-        wo = batch.wo
-        wi = batch.wi
-        roughness = batch.roughness
-        radiance = batch.radiance_rgb.mean(dim=1)
+        # Normalize world space positions to [0, 1] for DF network
+        pos_normalized = self._prepare_network_input(batch.position)
         
-        # Forward
-        context = self.context_net(pos, wi, roughness)
-        uv = self._direction_to_uv(wo)
-        u, v = uv[:, 0:1], uv[:, 1:2]
+        all_wo = batch.wo
+        all_wi = batch.wi
+        all_roughness = batch.roughness
+        all_radiance = batch.radiance_rgb.mean(dim=1).clamp(max=100.0)
         
-        # 1. Marginal
-        logits_u = self.marginal_head(context)
-        pdf_u_vals = self._get_density(logits_u, self.df_config.resolution_u)
-        val_u = self._eval_1d(pdf_u_vals, u, self.df_config.resolution_u)
+        total_samples = pos_normalized.shape[0]
+        BATCH_SIZE = 2 * 1024 
+        indices = torch.randperm(total_samples, device=self.device)
+        total_loss = 0.0
+        num_batches = 0
         
-        # 2. Conditional
-        u_feats = self.u_encoder(u)
-        cond_input = torch.cat([context, u_feats], dim=1)
-        logits_v = self.conditional_net(cond_input).float()
-        pdf_v_vals = self._get_density(logits_v, self.df_config.resolution_v)
-        val_v = self._eval_1d(pdf_v_vals, v, self.df_config.resolution_v)
-        
-        # Joint
-        pdf_uv = val_u * val_v
-        
-        # With area-preserving map, jacobian is constant, 
-        # so maximizing log(pdf_uv) is equivalent to maximizing log(pdf_dir)
-        # up to a constant. We can train on pdf_uv directly for stability, 
-        # or divide by 4pi. Let's be exact.
-        pdf_dir = pdf_uv / self._jacobian()
-        
-        # Loss
-        log_q = torch.log(pdf_dir + 1e-10)
-        weight = radiance.clamp(max=10.0)
-        loss = -(weight * log_q).mean()
-        
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        
-        return loss.item()
+        for start_idx in range(0, total_samples, BATCH_SIZE):
+            end_idx = min(start_idx + BATCH_SIZE, total_samples)
+            batch_idx = indices[start_idx:end_idx]
+            
+            pos = pos_normalized[batch_idx].contiguous()
+            wo = all_wo[batch_idx].contiguous()
+            wi = all_wi[batch_idx].contiguous()
+            roughness = all_roughness[batch_idx].contiguous()
+            radiance = all_radiance[batch_idx].contiguous().detach()
 
-    def sample_guided_direction(self, position, wi, roughness):
-        return self.sample(position, wi, roughness)
-    
-    def log_pdf(self, position, wi, wo, roughness):
-        return torch.log(self.pdf(position, wi, wo, roughness) + 1e-10)
-    
-    def train_step_from_batch(self, batch: TrainingBatch) -> float:
-        return self.train_step(batch)
-    
+            # Forward Pass
+            context = self.context_net(pos, wi, roughness)
+            uv = self._direction_to_uv(wo)
+            u, v = uv[:, 0:1], uv[:, 1:2]
+            
+            # Marginal
+            logits_u = self.marginal_head(context)
+            pdf_u_vals = self._get_density(logits_u, self.df_config.resolution_u)
+            val_u = self._eval_1d(pdf_u_vals, u, self.df_config.resolution_u, is_periodic=True)
+            
+            # Conditional
+            u_feats = self.u_encoder(u)
+            cond_input = torch.cat([context, u_feats], dim=1)
+            logits_v = self.conditional_net(cond_input).float()
+            pdf_v_vals = self._get_density(logits_v, self.df_config.resolution_v)
+            val_v = self._eval_1d(pdf_v_vals, v, self.df_config.resolution_v, is_periodic=False)
+            
+            # Joint
+            pdf_uv = val_u * val_v
+            
+            # Loss
+            log_q = torch.log(pdf_uv.clamp(min=1e-8))
+            loss = -(radiance * log_q).mean()
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+        return total_loss / max(1, num_batches)
+
     def get_distribution_for_visualization(self, position, wi, roughness):
+        """Return self for visualization - visualization uses pdf() directly.
+        
+        Args:
+            position: (1, 3) position in WORLD SPACE
+            wi: (1, 3) incoming direction
+            roughness: (1, 1) surface roughness
+            
+        Returns:
+            Self (visualization calls pdf() with stored context)
+        """
         self._vis_position = position
         self._vis_wi = wi
         self._vis_roughness = roughness

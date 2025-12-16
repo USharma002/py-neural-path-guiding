@@ -1,17 +1,4 @@
-"""Abstract base class for guiding distributions used in path guiding.
-
-This module defines the interface that any guiding distribution must implement.
-Concrete implementations (VMF, NIS, etc.) handle their own:
-- Network architecture
-- Parameter handling  
-- Training logic
-- Sampling logic
-
-To add a new distribution:
-1. Subclass GuidingDistribution
-2. Implement all abstract methods
-3. Import and use in PathGuidingSystem
-"""
+"""Abstract base class for guiding distributions used in path guiding."""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -41,15 +28,36 @@ class GuidingDistribution(ABC):
     - train_step(): Perform one training step given a batch of data
     
     The distribution is conditioned on scene context (position, incoming direction, etc.)
+    Each distribution normalizes positions according to its own needs using the scene bbox.
     """
     
     def __init__(self, config: Optional[GuidingConfig] = None):
         self.config = config or GuidingConfig()
         self.device = self.config.device
         
-        # Bounding box for position normalization (set by integrator)
+        # Scene reference for bbox-based normalization
+        self.scene: Optional[Any] = None
         self.bbox_min: Optional[torch.Tensor] = None
         self.bbox_max: Optional[torch.Tensor] = None
+
+    def set_scene(self, scene: Any) -> None:
+        """
+        Set the Mitsuba scene and extract bounding box for normalization.
+        
+        Implementations requiring ray tracing (like VXPG) should override this
+        and call super().set_scene(scene) to get bbox setup.
+        """
+        self.scene = scene
+        if scene is not None:
+            bbox = scene.bbox()
+            
+            # Convert Mitsuba ScalarPoint3f to list then to torch tensor
+            # ScalarPoint3f doesn't support DLPack, so we extract components manually
+            bbox_min_list = [bbox.min[i] for i in range(3)]
+            bbox_max_list = [bbox.max[i] for i in range(3)]
+            
+            self.bbox_min = torch.tensor(bbox_min_list, dtype=torch.float32, device=self.device)
+            self.bbox_max = torch.tensor(bbox_max_list, dtype=torch.float32, device=self.device)
     
     @abstractmethod
     def sample(
@@ -61,7 +69,7 @@ class GuidingDistribution(ABC):
         """Sample directions from the guiding distribution.
         
         Args:
-            position: Surface positions (N, 3), normalized to [-1,1]^3
+            position: Surface positions (N, 3), in WORLD SPACE
             wi: Incoming directions (N, 3), normalized
             roughness: Surface roughness (N, 1)
             
@@ -69,6 +77,8 @@ class GuidingDistribution(ABC):
             Tuple of:
             - directions: (N, 3) sampled unit vectors in local coordinates
             - pdf_values: (N,) probability densities
+            
+        NOTE: Implementation should call self._normalize_position(position) as needed
         """
         pass
     
@@ -83,13 +93,15 @@ class GuidingDistribution(ABC):
         """Evaluate the probability density for given directions.
         
         Args:
-            position: Surface positions (N, 3)
+            position: Surface positions (N, 3), in WORLD SPACE
             wi: Incoming directions (N, 3)
             wo: Outgoing directions to evaluate (N, 3)
             roughness: Surface roughness (N, 1)
             
         Returns:
             (N,) probability density values
+            
+        NOTE: Implementation should call self._normalize_position(position) as needed
         """
         pass
     
@@ -104,13 +116,15 @@ class GuidingDistribution(ABC):
         """Evaluate the log probability density for given directions.
         
         Args:
-            position: Surface positions (N, 3)
+            position: Surface positions (N, 3), in WORLD SPACE
             wi: Incoming directions (N, 3)
             wo: Outgoing directions to evaluate (N, 3)
             roughness: Surface roughness (N, 1)
             
         Returns:
             (N,) log probability density values
+            
+        NOTE: Implementation should call self._normalize_position(position) as needed
         """
         pass
     
@@ -119,10 +133,12 @@ class GuidingDistribution(ABC):
         """Perform one training step.
         
         Args:
-            batch: TrainingBatch with all necessary training data
+            batch: TrainingBatch with positions in WORLD SPACE
             
         Returns:
             Loss value for this step
+            
+        NOTE: Implementation should call self._normalize_position(batch.position) as needed
         """
         pass
     
@@ -139,20 +155,22 @@ class GuidingDistribution(ABC):
         the distribution (e.g., vMF mixture parameters, flow samples, etc.)
         
         Args:
-            position: Single position (1, 3)
+            position: Single position (1, 3), in WORLD SPACE
             wi: Single incoming direction (1, 3)
             roughness: Single roughness value (1, 1)
             
         Returns:
             Distribution-specific visualization object
+            
+        NOTE: Implementation should call self._normalize_position(position) as needed
         """
         pass
-    
-    def _normalize_position(self, pos: torch.Tensor) -> torch.Tensor:
-        """Normalize world position to [-1, 1]^3 range."""
-        if self.bbox_min is None or self.bbox_max is None:
-            return pos
-        return 2 * ((pos - self.bbox_min) / (self.bbox_max - self.bbox_min + 1e-8)) - 1
+
+    def map_to_voxel_index(self, position_01: torch.Tensor, resolution: int) -> torch.Tensor:
+        """Helper to map [0,1] positions to voxel indices [0, res-1]."""
+        # Clamp to ensure 1.0 doesn't overflow to resolution
+        pos_clamped = torch.clamp(position_01, 0.0, 0.999999)
+        return (pos_clamped * resolution).long()
     
     @property
     @abstractmethod

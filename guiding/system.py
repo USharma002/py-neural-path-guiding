@@ -1,23 +1,15 @@
-"""Path guiding system that trains and queries the neural guiding network.
-
-This module provides the main PathGuidingSystem class which coordinates:
-- Data preparation from the integrator
-- Training of the underlying distribution
-- Sampling and PDF evaluation for rendering
-
-The actual distribution (VMF, NIS, etc.) is pluggable via composition.
-Use guiding_registry to register new guiding methods.
-"""
+"""Path guiding system that trains and queries the neural guiding network."""
 from __future__ import annotations
 
-from typing import Optional, Tuple, TYPE_CHECKING, Union
+from typing import Optional, Tuple, TYPE_CHECKING, Any
 
 import drjit as dr
 import torch
+import logging
 
 from guiding.config import get_logger, TrainingConfig
 from utils.math_utils import M_EPSILON
-from guiding.training_data import TrainingBatch
+from guiding.training_data import TrainingBatch, prepare_shared_training_data
 import guiding.registry as registry
 
 if TYPE_CHECKING:
@@ -29,18 +21,8 @@ logger = get_logger("guiding")
 class PathGuidingSystem:
     """Main path guiding system that coordinates training and inference.
     
-    This class handles:
-    - Data preparation and validation from the integrator
-    - Bounding box normalization
-    - Delegation to the underlying distribution for sample/pdf/train
-    
-    The actual distribution is created via guiding_registry,
-    keeping a clean interface for the integrator.
-    
-    Args:
-        device: Device to run computations on
-        config: Training configuration
-        method_name: Name of the guiding method (from registry)
+    Position normalization is delegated to individual distributions.
+    Each distribution receives world-space positions and normalizes as needed.
     """
     
     def __init__(
@@ -52,35 +34,27 @@ class PathGuidingSystem:
     ) -> None:
         self.device = device
         self.config = config or TrainingConfig()
-        
-        # Store the method name for potential switching
+        self.scene  = None
+
         self._method_name = method_name or registry.get_default_method()
-        
-        # Bounding box for position normalization (set by integrator)
-        self.bbox_min: Optional[torch.Tensor] = None
-        self.bbox_max: Optional[torch.Tensor] = None
-        
-        # Create the underlying distribution from registry
         self._distribution = self._create_distribution(device, **kwargs)
         
-        # For visualization compatibility
-        self._vis_position: Optional[torch.Tensor] = None
-        self._vis_wi: Optional[torch.Tensor] = None
-        self._vis_roughness: Optional[torch.Tensor] = None
+        # Vis buffers
+        self._vis_position = None
+        self._vis_wi = None
+        self._vis_roughness = None
         
         logger.info(f"Path Guiding System initialized with {self._distribution.name}")
 
+    def set_scene(self, scene: Any) -> None:
+        """Pass the Mitsuba scene to the system and underlying distribution."""
+        self.scene = scene
+        self._distribution.set_scene(scene)
+
     def _create_distribution(self, device: str, **kwargs):
-        """Create the underlying guiding distribution from registry."""
         return registry.create_distribution(self._method_name, device, **kwargs)
     
     def switch_method(self, method_name: str, **kwargs) -> None:
-        """Switch to a different guiding method.
-        
-        Args:
-            method_name: Name of the new method (must be registered)
-            **kwargs: Additional arguments for the new distribution
-        """
         if method_name == self._method_name:
             logger.info(f"Already using {method_name}")
             return
@@ -88,103 +62,42 @@ class PathGuidingSystem:
         logger.info(f"Switching guiding method from {self._method_name} to {method_name}")
         self._method_name = method_name
         self._distribution = registry.create_distribution(method_name, self.device, **kwargs)
+        if self.scene is not None:
+            self._distribution.set_scene(self.scene)
     
     @property
     def method_name(self) -> str:
-        """Get the current guiding method name."""
         return self._method_name
 
-    def _normalize_position(self, pos: torch.Tensor) -> torch.Tensor:
-        """Normalize world position to [0, 1]^3 range for distribution."""
-        if self.bbox_min is None or self.bbox_max is None:
-            return pos
-        return (pos - self.bbox_min) / (self.bbox_max - self.bbox_min + 1e-8)
-
-    def prepare_training_data(
-        self, 
-        integrator: "PathGuidingIntegrator"
-    ) -> Tuple[Optional[torch.Tensor], ...]:
-        """Process integrator's record to produce clean, validated training tensors.
-        
-        Args:
-            integrator: The path guiding integrator with surface interaction data
-            
-        Returns:
-            Tuple of (pos, wo, wi, roughness, targets_li, combined_pdf) or 
-            tuple of Nones if no valid data
-        """
-        rec = integrator.surfaceInteractionRecord
-        integrator.scatter_data_into_buffer()
-
-        if dr.width(rec.position) == 0:
-            return (None,) * 6
-
-        pos = rec.position.torch()
-        wi = rec.wi.torch()
-        wo = rec.wo.torch()
-
-        pos = self._normalize_position(pos)
-
-        targets_li = rec.radiance.torch()
-        combined_pdf = rec.woPdf.torch()
-
-        # Filter invalid samples
-        valid_mask = combined_pdf > M_EPSILON
-        valid_mask &= ~torch.any(torch.isinf(pos) | torch.isnan(pos), dim=1)
-        valid_mask &= ~torch.any(torch.isinf(wo) | torch.isnan(wo), dim=1)
-        valid_mask &= ~torch.any(torch.isinf(wi) | torch.isnan(wi), dim=1)
-
-        wi_len_sq = torch.sum(wi * wi, dim=1)
-        valid_mask &= (wi_len_sq > 0.9) & (wi_len_sq < 1.1)
-
-        if not torch.any(valid_mask):
-            return (None,) * 6
-
-        pos = pos[valid_mask]
-        wi = wi[valid_mask]
-        wo = wo[valid_mask]
-        targets_li = targets_li[valid_mask]
-        combined_pdf = combined_pdf[valid_mask]
-
-        roughness = torch.ones((pos.shape[0], 1), device=self.device)
-
-        return pos, wo, wi, roughness, targets_li, combined_pdf
+    def _log_data_stats(self, label: str, tensor: torch.Tensor) -> None:
+        """Helper to log min/max/mean of a tensor for debugging."""
+        if logger.isEnabledFor(logging.INFO):
+            with torch.no_grad():
+                t_min = tensor.min(dim=0)[0]
+                t_max = tensor.max(dim=0)[0]
+                l_min = [f"{x:.3f}" for x in t_min.cpu().tolist()]
+                l_max = [f"{x:.3f}" for x in t_max.cpu().tolist()]
+                logger.info(f"[{label}] Min: {l_min}, Max: {l_max}")
 
     def train_step(self, integrator: "PathGuidingIntegrator") -> float:
         """Perform one training step using data from the integrator.
         
-        Args:
-            integrator: The path guiding integrator with training data
-            
-        Returns:
-            Loss value, or -1.0 if training was skipped
+        The batch contains world-space positions. The distribution
+        handles normalization internally.
         """
-        pos, wo, wi, roughness, targets_li, combined_pdf = self.prepare_training_data(integrator)
+        # 1. Use the shared function to get a validated batch (world space positions)
+        batch = prepare_shared_training_data(integrator, device=self.device)
 
-        if pos is None:
-            logger.warning("Skipping training step due to no valid data.")
+        # 2. Check validity
+        if not batch.is_valid():
+            logger.warning("Skipping training step due to no valid data (width=0 or all filtered).")
             return -1.0
-
-        # Create batch and delegate to distribution
-        batch = TrainingBatch(
-            position_normalized=pos,
-            wo=wo,
-            wi=wi,
-            roughness=roughness,
-            radiance_rgb=targets_li,
-            combined_pdf=combined_pdf
-        )
+        
+        # 4. Train - distribution handles normalization
         return self._distribution.train_step(batch)
 
     def train_step_from_batch(self, batch: TrainingBatch) -> float:
-        """Train from a pre-prepared TrainingBatch.
-        
-        Args:
-            batch: TrainingBatch from prepare_shared_training_data()
-            
-        Returns:
-            Loss value, or -1.0 if training was skipped
-        """
+        """Train from a pre-prepared TrainingBatch."""
         if not batch.is_valid():
             return -1.0
         return self._distribution.train_step(batch)
@@ -196,8 +109,12 @@ class PathGuidingSystem:
         wo: torch.Tensor,
         roughness: torch.Tensor
     ) -> torch.Tensor:
-        """Compute the PDF of the guiding distribution for given directions."""
-        position = self._normalize_position(position)
+        """Compute the PDF of the guiding distribution.
+        
+        Args:
+            position: (N, 3) positions in WORLD SPACE
+        """
+        # Distribution handles normalization internally
         return self._distribution.pdf(position, wi, wo, roughness)
     
     def get_distribution_for_visualization(
@@ -206,8 +123,13 @@ class PathGuidingSystem:
         wi: torch.Tensor,
         roughness: torch.Tensor
     ) -> "PathGuidingSystem":
-        """Return self for visualization - pdf() will be called directly."""
-        self._vis_position = self._normalize_position(position)
+        """Return self for visualization.
+        
+        Args:
+            position: (1, 3) position in WORLD SPACE
+        """
+        # Store world space - distribution will normalize when needed
+        self._vis_position = position
         self._vis_wi = wi
         self._vis_roughness = roughness
         return self
@@ -221,12 +143,7 @@ class PathGuidingSystem:
         """Sample directions from the trained guiding distribution.
         
         Args:
-            position: World positions
-            wi: Incoming directions  
-            roughness: Surface roughness values
-            
-        Returns:
-            Tuple of (sampled_directions, pdf_values)
+            position: (N, 3) positions in WORLD SPACE
         """
-        position = self._normalize_position(position)
+        # Distribution handles normalization internally
         return self._distribution.sample(position, wi, roughness)

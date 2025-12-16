@@ -1,4 +1,5 @@
 """Data structures for recording surface interactions during path tracing."""
+
 from __future__ import annotations
 
 import drjit as dr
@@ -6,72 +7,99 @@ import mitsuba as mi
 
 
 class SurfaceInteractionRecord:
-    """Custom data struct to hold surface interaction recordings.
-    
-    This structure stores all relevant information about surface interactions
-    encountered during path tracing, used for training the guiding network.
-    
-    Attributes:
-        position: World-space position of the intersection
-        wi: Incoming direction (from camera/previous bounce)
-        wo: Outgoing direction (sampled using BSDF)
-        wo_world: Outgoing direction in world coordinates
-        normal: Surface shading normal
-        bsdf: BSDF value at the intersection
-        radiance: Incoming radiance at this vertex
-        woPdf: Combined PDF of the sampled direction
-        bsdfPdf: PDF from BSDF sampling only
-        isDelta: Whether this is a delta scattering event
-        active: Whether this lane is active
+    """Holds per-vertex data for training guiding / NIS.
+
+    Added fields needed for NIS paper-style MIS-aware training:
+    - guidePdf: p_guide(wo) evaluated at the actually-sampled wo
+    - sampleSource: 0=BSDF sampled wo, 1=Guiding sampled wo
+    - bsdfFraction: mixture coefficient used at sampling time
+    - guidingActive: whether guiding was enabled for that vertex
+    - depth: bounce index (optional but useful for analysis/bucketing)
     """
+
     DRJIT_STRUCT = {
-        'position' : mi.Vector3f, # normalized to [-1, 1]^3?
-        'wi' : mi.Vector3f, # [theta, phi] wi, where theta in [0, pi] and phi in [0, 2pi]
-        'wo' : mi.Vector3f, # [theta, phi] wi, where theta in [0, pi] and phi in [0, 2pi]
-        'wo_world' : mi.Vector3f, # [theta, phi] wi, where theta in [0, pi] and phi in [0, 2pi]
-    
-        # Storation needed for calculation
-        'bsdf' : mi.Color3f, # [optional] for learning 5-D product distribution L_i * f_r
-        'normal': mi.Vector3f, # [auxiliary] surface (shading) normal where theta in [0, pi] and phi in [0, 2pi]
-        'throughputBsdf' : mi.Color3f, # throughput at current radiance, used to calculate local radiance
-        'throughputRadiance' : mi.Spectrum, # local radiance 
-        'emittedRadiance' : mi.Spectrum, # Le emitted from light source
-        
-        'radiance' : mi.Float,
-        'product' : mi.Spectrum, # radiance_spectrum * bsdf  (outgoing radiance)
-        
-        'woPdf' : mi.Float, # the combined pdf of the sampled direction
-        'bsdfPdf' : mi.Float, # [optional] the pdf of the sampled bsdf, for learning selection
-        'statisticalWeight' : mi.Float,
-        'isDelta' : mi.Bool, # is this scatter event is sampled from a delta lobe?
-        'active' : mi.Bool, # whether current lane is active or not
-        'twoSided': mi.Bool, # is the surface two-sided?
-        'miss': mi.Bool, # is this scatter event added for NRC alignment since it's a miss?
-        
-        # Opitonal inputs
-        'radiance_nee' : mi.Color3f, # radiance by the NEE
-        'direction_nee' : mi.Vector2f, # direction of the light for NEE
-        'diffuse' : mi.Color3f, # [auxiliary] diffuse color of the surface
-        'specular': mi.Color3f, # [auxiliary] specular color of the surface
+        # Geometry / directions
+        "position": mi.Vector3f,
+        "normal": mi.Vector3f,
+        "wi": mi.Vector3f,          # local
+        "wo": mi.Vector3f,          # local
+        "wo_world": mi.Vector3f,    # world
+
+        # Shading / transport terms
+        "bsdf": mi.Color3f,                 # usually BSDF weight term used in throughput update
+        "throughputBsdf": mi.Color3f,       # optional
+        "throughputRadiance": mi.Spectrum,  # optional
+        "emittedRadiance": mi.Spectrum,     # optional
+
+        # Targets
+        "radiance": mi.Float,       # scalar (often luminance-like)
+        "product": mi.Spectrum,     # spectrum target used by your training pipeline
+
+        # PDFs / sampling bookkeeping
+        "woPdf": mi.Float,          # combined mixture pdf used for estimator (your existing combined_pdf)
+        "bsdfPdf": mi.Float,        # bsdf-only pdf
+        "guidePdf": mi.Float,       # guide-only pdf at sampled wo  (NEW)
+        "bsdfFraction": mi.Float,   # mixture weight used at sampling time (NEW)
+        "sampleSource": mi.UInt32,  # 0=BSDF, 1=GUIDE (NEW)
+
+        # Flags / misc
+        "isDelta": mi.Bool,
+        "guidingActive": mi.Bool,     
+        "active": mi.Bool,
+
+        # Optional extras already present in your struct
+        "statisticalWeight": mi.Float,
+        "twoSided": mi.Bool,
+        "miss": mi.Bool,
+
+        "radiance_nee": mi.Color3f,
+        "direction_nee": mi.Vector2f,
+
+        "diffuse": mi.Color3f,
+        "specular": mi.Color3f,
+
+        # Optional (NEW)
+        "depth": mi.UInt32,
     }
 
     def __init__(self) -> None:
-        self.position = mi.Vector3f()
-        self.wo = mi.Vector3f()
-        self.wi = mi.Vector3f()
-        self.normal = mi.Vector3f()
+        # Geometry / directions
+        self.position = mi.Vector3f(0.0)
+        self.normal = mi.Vector3f(0.0)
+        self.wi = mi.Vector3f(0.0)
+        self.wo = mi.Vector3f(0.0)
+        self.wo_world = mi.Vector3f(0.0)
 
-        self.emittedRadiance = mi.Spectrum() # Le
-        self.throughputRadiance = mi.Spectrum() # L
-        
-        self.bsdf = mi.Color3f() # bsdf
-        self.throughputBsdf = mi.Color3f() # thp
-        self.normal = mi.Vector3f()
-        
-        self.product = mi.Spectrum() # bsdf * L
-        
-        self.woPdf = mi.Float()
-        self.bsdfPdf = mi.Float()
-        self.isDelta = mi.Bool()
-        
-        self.active = mi.Bool()
+        # Shading / transport
+        self.bsdf = mi.Color3f(0.0)
+        self.throughputBsdf = mi.Color3f(0.0)
+        self.throughputRadiance = mi.Spectrum(0.0)
+        self.emittedRadiance = mi.Spectrum(0.0)
+
+        # Targets
+        self.radiance = mi.Float(0.0)
+        self.product = mi.Spectrum(0.0)
+
+        # PDFs / bookkeeping
+        self.woPdf = mi.Float(0.0)
+        self.bsdfPdf = mi.Float(0.0)
+        self.guidePdf = mi.Float(0.0)         
+        self.bsdfFraction = mi.Float(1.0)        
+        self.sampleSource = mi.UInt32(0)   
+
+        # Flags / misc
+        self.isDelta = mi.Bool(False)
+        self.guidingActive = mi.Bool(False)     
+        self.active = mi.Bool(False)
+
+        self.statisticalWeight = mi.Float(1.0)
+        self.twoSided = mi.Bool(False)
+        self.miss = mi.Bool(False)
+
+        self.radiance_nee = mi.Color3f(0.0)
+        self.direction_nee = mi.Vector2f(0.0)
+
+        self.diffuse = mi.Color3f(0.0)
+        self.specular = mi.Color3f(0.0)
+
+        self.depth = mi.UInt32(0)               

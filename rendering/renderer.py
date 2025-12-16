@@ -94,6 +94,7 @@ class Renderer:
 
 		if hasattr(integrator, 'setup'):
 			integrator.setup(
+				scene=scene,
 				num_rays=self.num_rays,
 				bbox_min=scene.bbox().min,
 				bbox_max=scene.bbox().max
@@ -109,10 +110,13 @@ class Renderer:
 		
 		# When guiding, we must disable loop recording.
 		# When NOT guiding, we WANT loop recording for maximum performance.
-		is_complex_integrator = isinstance(integrator, PathGuidingIntegrator)
+		is_complex_integrator = integrator.bsdfSamplingFraction > 0.0 if isinstance(integrator, PathGuidingIntegrator) else False
 		if is_complex_integrator:
 			dr.set_flag(dr.JitFlag.LoopRecord, False)
 			dr.set_flag(dr.JitFlag.VCallRecord, False)
+		else:
+			dr.set_flag(dr.JitFlag.LoopRecord, True)
+			dr.set_flag(dr.JitFlag.VCallRecord, True)
 		
 		for i in pbar:
 			if progress_setter:
@@ -125,7 +129,7 @@ class Renderer:
 			
 			frame = self.render_frame(scene, integrator)
 			
-			accumulated_radiance += frame.torch()
+			accumulated_radiance += frame.torch().T
 
 		# Restore JIT flags to default state after rendering is complete.
 		if is_complex_integrator:

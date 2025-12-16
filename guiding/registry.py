@@ -1,4 +1,5 @@
-"""Registry for guiding distribution methods.
+"""
+Registry for guiding distribution methods.
 
 This module provides a simple registration system for guiding distributions.
 To add a new guiding method:
@@ -94,7 +95,7 @@ def set_default_method(name: str) -> None:
     if name in _REGISTRY:
         _DEFAULT_METHOD = name
     else:
-        raise ValueError(f"Unknown guiding method: {name}")
+        raise ValueError(f"Unknown guiding method: {name}. Available: {list(_REGISTRY.keys())}")
 
 
 def create_distribution(name: str, device: str = "cuda", **kwargs):
@@ -131,86 +132,58 @@ def create_distribution(name: str, device: str = "cuda", **kwargs):
 # =============================================================================
 
 # --- VMF (von Mises-Fisher) Mixture ---
-from guiding.vmf_guiding import VMFGuidingDistribution, VMFConfig
+try:
+    from guiding.vmf_guiding import VMFGuidingDistribution, VMFConfig
 
-def _create_vmf(device: str = "cuda", **kwargs) -> VMFGuidingDistribution:
-    """Factory function for VMF - uses VMFConfig defaults."""
-    config = VMFConfig(device=device, **kwargs)
-    return VMFGuidingDistribution(config)
+    def _create_vmf(device: str = "cuda", **kwargs) -> VMFGuidingDistribution:
+        """Factory function for VMF - uses VMFConfig defaults."""
+        config = VMFConfig(device=device, **kwargs)
+        return VMFGuidingDistribution(config)
 
-register(
-    name="VMF Mixture",
-    distribution_class=VMFGuidingDistribution,
-    description="Fast von Mises-Fisher mixture model (recommended for real-time)",
-    is_default=True,
-    factory=_create_vmf
-)
+    register(
+        name="VMF Mixture",
+        distribution_class=VMFGuidingDistribution,
+        description="Fast von Mises-Fisher mixture model (recommended for real-time)",
+        is_default=True,
+        factory=_create_vmf
+    )
+except ImportError:
+    logger.warning("Could not import VMF Guiding (vmf_guiding.py missing?)")
+
 
 # --- NIS (Neural Importance Sampling) ---
-from guiding.nis_guiding import NISGuidingDistribution, NISConfig
+try:
+    from guiding.nis_guiding import NISGuidingDistribution, NISConfig
 
-def _create_nis(device: str = "cuda", **kwargs) -> NISGuidingDistribution:
-    """Factory function for NIS - uses NISConfig defaults."""
-    config = NISConfig(device=device, **kwargs)
-    return NISGuidingDistribution(config)
+    def _create_nis(device: str = "cuda", **kwargs) -> NISGuidingDistribution:
+        """Factory function for NIS - uses NISConfig defaults."""
+        config = NISConfig(device=device, **kwargs)
+        return NISGuidingDistribution(config)
 
-register(
-    name="NIS (Neural Importance Sampling)",
-    distribution_class=NISGuidingDistribution,
-    description="Normalizing flow-based importance sampling (slower but more expressive)",
-    factory=_create_nis
-)
+    register(
+        name="NIS (Neural Importance Sampling)",
+        distribution_class=NISGuidingDistribution,
+        description="Normalizing flow-based importance sampling (slower but more expressive)",
+        factory=_create_nis
+    )
+except ImportError:
+    logger.warning("Could not import NIS Guiding (nis_guiding.py missing?)")
+
 
 # --- DF (Distribution Factorization) ---
-from guiding.df_guiding import DFGuidingDistribution, DFConfig
+try:
+    from guiding.df_guiding import DFGuidingDistribution, DFConfig
 
-def _create_df(device: str = "cuda", **kwargs) -> DFGuidingDistribution:
-    """Factory function for DF - uses DFConfig defaults."""
-    config = DFConfig(device=device, **kwargs)
-    return DFGuidingDistribution(config)
+    def _create_df(device: str = "cuda", **kwargs) -> DFGuidingDistribution:
+        """Factory function for DF - uses DFConfig defaults."""
+        config = DFConfig(device=device, **kwargs)
+        return DFGuidingDistribution(config)
 
-register(
-    name="DF (Distribution Factorization)",
-    distribution_class=DFGuidingDistribution,
-    description="Distribution factorization with area-preserving mapping",
-    factory=_create_df
-)
-
-# --- PPG (Practical Path Guiding) ---
-from guiding.ppg_guiding import PPGGuidingDistribution, PPGConfig
-
-def _create_ppg(device: str = "cuda", **kwargs) -> PPGGuidingDistribution:
-    """Factory function for PPG - uses PPGConfig defaults.
-    
-    Note: PPG requires scene bounding box to be set via:
-        distribution.set_scene_bounds(bbox_min, bbox_max)
-    after creation.
-    """
-    config = PPGConfig(device=device, **kwargs)
-    return PPGGuidingDistribution(config)
-
-register(
-    name="PPG (Practical Path Guiding)",
-    distribution_class=PPGGuidingDistribution,
-    description="SD-Tree based guiding (no neural network, requires scene bounds)",
-    factory=_create_ppg
-)
-
-
-# =============================================================================
-# Add your custom guiding methods below!
-# Example:
-#
-# from my_custom_guiding import MyCustomDistribution, MyCustomConfig
-#
-# def _create_my_custom(device: str = "cuda", **kwargs):
-#     config = MyCustomConfig(device=device, **kwargs)
-#     return MyCustomDistribution(config)
-#
-# register(
-#     name="My Custom Method",
-#     distribution_class=MyCustomDistribution,
-#     description="My awesome custom guiding method",
-#     factory=_create_my_custom
-# )
-# =============================================================================
+    register(
+        name="DF (Distribution Factorization)",
+        distribution_class=DFGuidingDistribution,
+        description="Distribution factorization with area-preserving mapping",
+        factory=_create_df
+    )
+except ImportError:
+    logger.warning("Could not import DF Guiding (df_guiding.py missing?)")

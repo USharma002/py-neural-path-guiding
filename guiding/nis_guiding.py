@@ -1,19 +1,21 @@
-"""Neural Importance Sampling (NIS) guiding distribution.
-
-This module implements path guiding using piecewise-quadratic coupling flows,
-based on the NIS paper: "Neural Importance Sampling" (Müller et al., 2019).
-
-The NIS approach uses normalizing flows to learn the importance distribution,
-with the key insight that piecewise-quadratic couplings allow:
-- Exact density evaluation (for MIS weights)
-- Fast sampling (via inverse CDF)
-- Efficient training (via KL divergence minimization)
 """
+Neural Importance Sampling (NIS) guiding distribution (paper-closer, MIS-aware training).
+
+What this version changes vs your current nis_guiding.py:
+- Uses importance weights w = radiance_scalar / combined_pdf (combined sampling density that generated wo).
+- Trains against q_eff = c * p_bsdf + (1 - c) * q_guide (MIS-aware objective), where:
+    c is either the logged bsdf_fraction (default, stable), or a learned selection network.
+- Uses hemisphere equal-area parameterization (z in [0,1]) so guided samples never go below the surface.
+
+This file is designed to be a drop-in replacement under your GuidingDistribution API.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, Any, Optional
+from typing import Tuple, Optional, Literal
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,585 +33,619 @@ from guiding.config import get_logger
 logger = get_logger("nis_guiding")
 
 
+# ======================================================================================
+# Config
+# ======================================================================================
+
 @dataclass
 class NISConfig(GuidingConfig):
-    """Configuration for NIS guiding distribution."""
     # Flow architecture
     num_coupling_layers: int = 4
     num_bins: int = 32
-    hidden_dim: int = 64
-    
-    # Conditioning network (encodes position/wi into conditioning)
+    hidden_dim: int = 128
     conditioning_dim: int = 64
-    
-    # Training
-    learning_rate: float = 5e-3
-    
-    # Use tinycudann for acceleration
+
+    # Encoding for the conditioning net (paper-like: one-blob)
+    oneblob_bins: int = 32
     use_tcnn: bool = True
 
+    # Training
+    divergence: Literal["kl", "chi2"] = "kl"
+    learning_rate: float = 5e-3
+    grad_clip_norm: float = 10.0
+    epsilon: float = 1e-8
+
+    # Weighting (importance weights)
+    max_weight: float = 50.0
+    max_radiance: float = 1e6
+
+    # Minibatching (keep small to reduce VRAM spikes)
+    batch_size: int = 65536
+
+    # Mixture / selection
+    use_logged_bsdf_fraction: bool = True  # use batch.bsdf_fraction as c (most stable with your current integrator)
+    learn_selection: bool = False          # if True, learn c(x) and optimize q_eff using c_pred
+    selection_hidden: int = 64
+
+
+# ======================================================================================
+# Hemisphere equal-area mapping: (u,v) in [0,1]^2 <-> direction with z in [0,1]
+# Area element on hemisphere is dA = dphi dz, total area = 2*pi => Jacobian = 2*pi.
+# ======================================================================================
+
+def dir_to_uv_hemi(d: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    d = F.normalize(d, dim=-1)
+    z = d[:, 2].clamp(0.0, 1.0)  # hemisphere
+    phi = torch.atan2(d[:, 1], d[:, 0])  # [-pi, pi]
+    u = (phi + math.pi) / (2.0 * math.pi)
+    v = z
+    return torch.stack([u, v], dim=1).clamp(eps, 1.0 - eps)
+
+def uv_to_dir_hemi(uv: torch.Tensor) -> torch.Tensor:
+    u = uv[:, 0].clamp(0.0, 1.0)
+    z = uv[:, 1].clamp(0.0, 1.0)
+    phi = u * (2.0 * math.pi) - math.pi
+    sin_theta = torch.sqrt((1.0 - z * z).clamp(min=0.0))
+    x = sin_theta * torch.cos(phi)
+    y = sin_theta * torch.sin(phi)
+    return torch.stack([x, y, z], dim=1)
+
+def jacobian_hemi() -> float:
+    return 2.0 * math.pi
+
+
+# ======================================================================================
+# One-blob encoding (PyTorch fallback)
+# ======================================================================================
+
+class OneBlobEncoder(nn.Module):
+    def __init__(self, dims: int, bins: int):
+        super().__init__()
+        self.dims = dims
+        self.bins = bins
+        centers = torch.linspace(0.0, 1.0, bins)
+        self.register_buffer("centers", centers)
+        self.sigma = 1.0 / bins
+
+    def forward(self, x01: torch.Tensor) -> torch.Tensor:
+        # x01: (N, D) in [0,1]
+        diff = x01.unsqueeze(-1) - self.centers.view(1, 1, -1)  # (N, D, B)
+        enc = torch.exp(-0.5 * (diff / self.sigma) ** 2)
+        return enc.reshape(x01.shape[0], -1)  # (N, D*B)
+
+
+# ======================================================================================
+# Conditioning network
+# ======================================================================================
+
+class ConditioningNetwork(nn.Module):
+    """
+    Paper-closer conditioning: OneBlob over (pos01, wi01, rough01) -> MLP -> conditioning vector.
+    Input dims: 3 + 3 + 1 = 7.
+    """
+
+    def __init__(self, out_dim: int, oneblob_bins: int, hidden_dim: int, use_tcnn: bool):
+        super().__init__()
+        self.use_tcnn = bool(use_tcnn and TCNN_AVAILABLE)
+
+        in_dims = 7
+        if self.use_tcnn:
+            # OneBlob encoding on all 7 dims.
+            encoding = {"otype": "OneBlob", "n_bins": oneblob_bins}
+            network = {
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": hidden_dim,
+                "n_hidden_layers": 2,
+            }
+            self.net = tcnn.NetworkWithInputEncoding(
+                n_input_dims=in_dims,
+                n_output_dims=out_dim,
+                encoding_config=encoding,
+                network_config=network,
+            )
+        else:
+            self.encoder = OneBlobEncoder(in_dims, oneblob_bins)
+            self.net = nn.Sequential(
+                nn.Linear(in_dims * oneblob_bins, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, out_dim),
+            )
+
+    def forward(self, pos01: torch.Tensor, wi01: torch.Tensor, rough01: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([pos01, wi01, rough01], dim=1).clamp(0.0, 1.0)
+        if self.use_tcnn:
+            return self.net(x.contiguous()).float()
+        return self.net(self.encoder(x))
+
+
+# ======================================================================================
+# Piecewise quadratic coupling (1D) conditioned on scene features
+# Outputs K widths + (K+1) vertices
+# ======================================================================================
 
 class PiecewiseQuadraticCoupling(nn.Module):
-    """Piecewise-quadratic coupling layer for normalizing flows.
-    
-    Implements the coupling transform from NIS paper Section 4.
-    The piecewise-quadratic CDF allows exact density evaluation
-    while being invertible for sampling.
-    """
-    
-    def __init__(self, num_bins: int = 32, hidden_dim: int = 64, use_tcnn: bool = True):
+    def __init__(self, num_bins: int, cond_dim: int, hidden_dim: int, oneblob_bins: int, use_tcnn: bool, eps: float):
         super().__init__()
-        self.num_bins = num_bins
-        self.n_out = num_bins + (num_bins + 1)  # Widths (K) + Vertices (K+1)
-        
-        if use_tcnn and TCNN_AVAILABLE:
-            self._build_tcnn_network(hidden_dim)
-        else:
-            self._build_pytorch_network(hidden_dim)
-    
-    def _build_tcnn_network(self, hidden_dim: int):
-        """Build network using tinycudann for speed."""
-        self.use_tcnn = True
-        
-        encoding_config = {
-            "otype": "OneBlob",
-            "n_bins": self.num_bins
-        }
-        
-        network_config = {
-            "otype": "FullyFusedMLP",
-            "activation": "ReLU",
-            "output_activation": "None",
-            "n_neurons": hidden_dim,
-            "n_hidden_layers": 3
-        }
-        
-        self.net = tcnn.NetworkWithInputEncoding(
-            n_input_dims=1,
-            n_output_dims=self.n_out,
-            encoding_config=encoding_config,
-            network_config=network_config
-        )
-    
-    def _build_pytorch_network(self, hidden_dim: int):
-        """Fallback PyTorch network."""
-        self.use_tcnn = False
-        
-        # OneBlob encoding
-        self.register_buffer('centers', torch.linspace(0, 1, self.num_bins))
-        self.sigma = 1.0 / self.num_bins
-        
-        self.net = nn.Sequential(
-            nn.Linear(self.num_bins, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, self.n_out)
-        )
-    
-    def _oneblob_encode(self, x: torch.Tensor) -> torch.Tensor:
-        """OneBlob positional encoding for PyTorch fallback."""
-        diff = x - self.centers.unsqueeze(0)
-        encoded = torch.exp(-0.5 * (diff / self.sigma) ** 2)
-        return encoded / (encoded.sum(dim=1, keepdim=True) + 1e-8)
-    
-    def get_params(self, x_a: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get normalized widths W and vertices V from conditioning input."""
+        self.K = num_bins
+        self.cond_dim = cond_dim
+        self.eps = eps
+        self.n_out = self.K + (self.K + 1)
+
+        self.use_tcnn = bool(use_tcnn and TCNN_AVAILABLE)
         if self.use_tcnn:
-            if not x_a.is_contiguous():
-                x_a = x_a.contiguous()
-            out = self.net(x_a).float()
+            encoding = {
+                "otype": "Composite",
+                "nested": [
+                    {"n_dims_to_encode": 1, "otype": "OneBlob", "n_bins": oneblob_bins},
+                    {"n_dims_to_encode": cond_dim, "otype": "Identity"},
+                ],
+            }
+            network = {
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": hidden_dim,
+                "n_hidden_layers": 3,
+            }
+            self.net = tcnn.NetworkWithInputEncoding(
+                n_input_dims=1 + cond_dim,
+                n_output_dims=self.n_out,
+                encoding_config=encoding,
+                network_config=network,
+            )
         else:
-            encoded = self._oneblob_encode(x_a.squeeze(-1))
-            out = self.net(encoded)
-        
-        W_unnorm, V_unnorm = torch.split(out, [self.num_bins, self.num_bins + 1], dim=1)
-        
-        # Normalize widths (softmax)
-        W = F.softmax(W_unnorm, dim=1)
-        
-        # Normalize vertices (trapezoidal area normalization)
-        exp_V = torch.exp(V_unnorm.clamp(-10, 10))  # Clamp for stability
-        v_left = exp_V[:, :-1]
-        v_right = exp_V[:, 1:]
-        trapezoid_areas = 0.5 * (v_left + v_right) * W
-        total_area = torch.sum(trapezoid_areas, dim=1, keepdim=True)
-        V = exp_V / (total_area + 1e-8)
-        
+            self.encoder_xa = OneBlobEncoder(1, oneblob_bins)
+            self.net = nn.Sequential(
+                nn.Linear(oneblob_bins + cond_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, self.n_out),
+            )
+
+    def _params(self, xa: torch.Tensor, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # xa: (N,1) in [0,1], cond: (N,C)
+        if self.use_tcnn:
+            inp = torch.cat([xa, cond], dim=1).contiguous()
+            out = self.net(inp).float()
+        else:
+            xa_enc = self.encoder_xa(xa)
+            out = self.net(torch.cat([xa_enc, cond], dim=1))
+
+        W_u, V_u = torch.split(out, [self.K, self.K + 1], dim=1)
+        W = F.softmax(W_u, dim=1)
+
+        V_u = V_u.clamp(-10, 10)
+        expV = torch.exp(V_u)
+
+        vL, vR = expV[:, :-1], expV[:, 1:]
+        areas = 0.5 * (vL + vR) * W
+        total = torch.sum(areas, dim=1, keepdim=True).clamp(min=self.eps)
+        V = expV / total
         return W, V
-    
-    def forward(self, x_b: torch.Tensor, W: torch.Tensor, V: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward transform: x -> z (data to latent), returns (z, log_det)."""
+
+    def forward(self, xb: torch.Tensor, xa: torch.Tensor, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        xb = xb.clamp(0.0, 1.0 - self.eps)
+        W, V = self._params(xa, cond)
+
         widths_cum = torch.cumsum(W, dim=1)
-        pad = torch.zeros((W.shape[0], 1), device=W.device)
+        pad = torch.zeros((W.shape[0], 1), device=W.device, dtype=W.dtype)
         edges = torch.cat([pad, widths_cum], dim=1)
         edges[:, -1] = 1.0
-        
-        val = x_b.clamp(0.0, 0.9999)
-        
-        # Find bin index
-        bin_idx = torch.sum(val >= edges, dim=1, keepdim=True) - 1
-        bin_idx = bin_idx.clamp(0, self.num_bins - 1)
-        
-        # Gather parameters for the bin
-        w_b = torch.gather(W, 1, bin_idx)
+
+        bin_idx = torch.sum(xb >= edges[:, :-1], dim=1, keepdim=True) - 1
+        bin_idx = bin_idx.clamp(0, self.K - 1)
+
+        w_b = torch.gather(W, 1, bin_idx).clamp(min=self.eps)
         v_b = torch.gather(V, 1, bin_idx)
         v_b1 = torch.gather(V, 1, bin_idx + 1)
-        edge_b = torch.gather(edges, 1, bin_idx)
-        
-        # Relative position in bin
-        alpha = (val - edge_b) / (w_b + 1e-8)
-        
-        # Cumulative area before this bin
-        v_all_left = V[:, :-1]
-        v_all_right = V[:, 1:]
-        areas = 0.5 * (v_all_left + v_all_right) * W
-        cum_areas = torch.cumsum(areas, dim=1)
+        edge_x = torch.gather(edges, 1, bin_idx)
+
+        alpha = ((xb - edge_x) / w_b).clamp(0.0, 1.0)
+
+        vL, vR = V[:, :-1], V[:, 1:]
+        bin_areas = 0.5 * (vL + vR) * W
+        cum_areas = torch.cumsum(bin_areas, dim=1)
         cum_areas_pad = torch.cat([pad, cum_areas], dim=1)
         area_pre = torch.gather(cum_areas_pad, 1, bin_idx)
-        
-        # Quadratic CDF within bin
-        term1 = alpha * v_b * w_b
-        term2 = 0.5 * (alpha ** 2) * (v_b1 - v_b) * w_b
-        z = area_pre + term1 + term2
-        
-        # Log determinant (log PDF)
-        pdf_val = v_b + alpha * (v_b1 - v_b)
-        log_det = torch.log(pdf_val + 1e-8)
-        
+
+        z = (area_pre + alpha * v_b * w_b + 0.5 * (alpha ** 2) * (v_b1 - v_b) * w_b).clamp(0.0, 1.0)
+
+        pdf_val = (v_b + alpha * (v_b1 - v_b)).clamp(min=self.eps)
+        log_det = torch.log(pdf_val)
         return z, log_det
-    
-    def inverse(self, z_b: torch.Tensor, W: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-        """Inverse transform: z -> x (latent to data), for sampling."""
+
+    def inverse(self, zb: torch.Tensor, xa: torch.Tensor, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        zb = zb.clamp(0.0, 1.0 - self.eps)
+        W, V = self._params(xa, cond)
+
         widths_cum = torch.cumsum(W, dim=1)
-        pad = torch.zeros((W.shape[0], 1), device=W.device)
+        pad = torch.zeros((W.shape[0], 1), device=W.device, dtype=W.dtype)
         edges = torch.cat([pad, widths_cum], dim=1)
         edges[:, -1] = 1.0
-        
-        target_area = z_b.clamp(0.0, 0.9999)
-        
-        # Compute cumulative areas
-        v_all_left = V[:, :-1]
-        v_all_right = V[:, 1:]
-        bin_areas = 0.5 * (v_all_left + v_all_right) * W
+
+        vL, vR = V[:, :-1], V[:, 1:]
+        bin_areas = 0.5 * (vL + vR) * W
         cum_areas = torch.cumsum(bin_areas, dim=1)
         cum_areas_edges = torch.cat([pad, cum_areas], dim=1)
         cum_areas_edges[:, -1] = 1.0
-        
-        # Find bin
-        bin_idx = torch.sum(target_area >= cum_areas_edges, dim=1, keepdim=True) - 1
-        bin_idx = bin_idx.clamp(0, self.num_bins - 1)
-        
-        # Gather parameters
-        w_b = torch.gather(W, 1, bin_idx)
+
+        bin_idx = torch.sum(zb >= cum_areas_edges[:, :-1], dim=1, keepdim=True) - 1
+        bin_idx = bin_idx.clamp(0, self.K - 1)
+
+        w_b = torch.gather(W, 1, bin_idx).clamp(min=self.eps)
         v_b = torch.gather(V, 1, bin_idx)
         v_b1 = torch.gather(V, 1, bin_idx + 1)
+
         edge_area = torch.gather(cum_areas_edges, 1, bin_idx)
         edge_x = torch.gather(edges, 1, bin_idx)
-        
-        # Solve quadratic: A*alpha^2 + B*alpha + C = 0
-        A = 0.5 * (v_b1 - v_b) * w_b
+
+        delta_v = v_b1 - v_b
+        A = 0.5 * delta_v * w_b
         B = v_b * w_b
-        C = edge_area - target_area
-        
-        det = (B ** 2 - 4 * A * C).clamp(min=0.0)
+        C = edge_area - zb
+
+        det = (B * B - 4.0 * A * C).clamp(min=0.0)
         sqrt_det = torch.sqrt(det)
-        
-        alpha_quad = (-B + sqrt_det) / (2 * A + 1e-10)
-        alpha_linear = -C / (B + 1e-10)
-        
-        is_quadratic = torch.abs(A) > 1e-6
-        alpha = torch.where(is_quadratic, alpha_quad, alpha_linear).clamp(0, 1)
-        
-        return edge_x + alpha * w_b
+
+        is_quad = torch.abs(A) > self.eps * torch.abs(B).clamp(min=1.0)
+        sign_B = torch.sign(B)
+        sign_B = torch.where(sign_B == 0.0, torch.ones_like(sign_B), sign_B)
+        denom = (B + sign_B * sqrt_det).clamp(min=self.eps)
+
+        alpha_q = (-2.0 * C) / denom
+        alpha_l = (-C) / B.clamp(min=self.eps)
+        alpha = torch.where(is_quad, alpha_q, alpha_l).clamp(0.0, 1.0)
+
+        xb = (edge_x + alpha * w_b).clamp(0.0, 1.0)
+
+        pdf_val = (v_b + alpha * (v_b1 - v_b)).clamp(min=self.eps)
+        log_det = torch.log(pdf_val)
+        return xb, log_det
 
 
-class ConditioningNetwork(nn.Module):
-    """Network that encodes (position, wi, roughness) into conditioning for the flow."""
-    
-    def __init__(self, output_dim: int = 64, use_tcnn: bool = True):
-        super().__init__()
-        # Input: position (3) + wi (3) + roughness (1) = 7
-        input_dim = 7
-        
-        if use_tcnn and TCNN_AVAILABLE:
-            config = {
-                "encoding": {
-                    "otype": "Composite",
-                    "nested": [
-                        {
-                            "n_dims_to_encode": 3,  # position
-                            "otype": "HashGrid",
-                            "n_levels": 8,
-                            "n_features_per_level": 2,
-                            "log2_hashmap_size": 17,
-                            "base_resolution": 16,
-                            "per_level_scale": 1.5,
-                        },
-                        {
-                            "n_dims_to_encode": 4,  # wi + roughness
-                            "otype": "Identity",
-                        }
-                    ]
-                },
-                "network": {
-                    "otype": "FullyFusedMLP",
-                    "activation": "ReLU",
-                    "output_activation": "None",
-                    "n_neurons": 64,
-                    "n_hidden_layers": 2,
-                }
-            }
-            self.net = tcnn.NetworkWithInputEncoding(
-                n_input_dims=input_dim,
-                n_output_dims=output_dim,
-                encoding_config=config["encoding"],
-                network_config=config["network"],
-            )
-            self.use_tcnn = True
-        else:
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, 64),
-                nn.ReLU(),
-                nn.Linear(64, 64),
-                nn.ReLU(),
-                nn.Linear(64, output_dim),
-            )
-            self.use_tcnn = False
-    
-    def forward(self, position: torch.Tensor, wi: torch.Tensor, roughness: torch.Tensor) -> torch.Tensor:
-        """Encode scene context into conditioning vector."""
-        if roughness.ndim == 1:
-            roughness = roughness.unsqueeze(1)
-        
-        x = torch.cat([position, wi, roughness], dim=1)
-        
-        if self.use_tcnn:
-            x = x.contiguous()
-        
-        return self.net(x).float()
-
+# ======================================================================================
+# 2D Flow on [0,1]^2
+# ======================================================================================
 
 class NISFlow(nn.Module):
-    """Neural Importance Sampling flow for 2D directional sampling.
-    
-    Uses piecewise-quadratic coupling layers to learn a mapping from
-    uniform [0,1]^2 to the target importance distribution on the hemisphere.
-    
-    The 2D parameterization uses spherical coordinates (theta, phi) mapped to [0,1]^2.
-    """
-    
-    def __init__(self, config: NISConfig):
+    def __init__(self, cfg: NISConfig):
         super().__init__()
-        self.config = config
-        
-        # Conditioning network
+        self.cfg = cfg
+
         self.conditioning = ConditioningNetwork(
-            output_dim=config.conditioning_dim,
-            use_tcnn=config.use_tcnn
+            out_dim=cfg.conditioning_dim,
+            oneblob_bins=cfg.oneblob_bins,
+            hidden_dim=cfg.hidden_dim,
+            use_tcnn=cfg.use_tcnn,
         )
-        
-        # Coupling layers - alternate which dimension is transformed
+
         self.layers = nn.ModuleList()
-        for i in range(config.num_coupling_layers):
-            # Each layer gets conditioning input + the "fixed" dimension
+        for _ in range(cfg.num_coupling_layers):
             self.layers.append(
                 PiecewiseQuadraticCoupling(
-                    num_bins=config.num_bins,
-                    hidden_dim=config.hidden_dim,
-                    use_tcnn=config.use_tcnn
+                    num_bins=cfg.num_bins,
+                    cond_dim=cfg.conditioning_dim,
+                    hidden_dim=cfg.hidden_dim,
+                    oneblob_bins=cfg.oneblob_bins,
+                    use_tcnn=cfg.use_tcnn,
+                    eps=cfg.epsilon,
                 )
             )
-            # Register mask as buffer
-            mask = torch.tensor([1.0, 0.0]) if i % 2 == 0 else torch.tensor([0.0, 1.0])
-            self.register_buffer(f'mask_{i}', mask)
-    
-    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
-        """Forward pass: compute log probability of x given condition.
-        
-        Args:
-            x: Points in [0,1]^2 (N, 2)
-            condition: Conditioning from ConditioningNetwork (N, conditioning_dim)
-            
-        Returns:
-            log_prob: Log probability (N,)
-        """
-        log_det_sum = torch.zeros(x.shape[0], device=x.device)
-        z = x
-        
+
+        # Alternating masks: transform dim 1 conditioned on dim 0, then swap
+        masks = []
+        for i in range(cfg.num_coupling_layers):
+            masks.append(torch.tensor([1.0, 0.0]) if (i % 2 == 0) else torch.tensor([0.0, 1.0]))
+        for i, m in enumerate(masks):
+            self.register_buffer(f"mask_{i}", m)
+
+    def forward_logprob_uv(self, uv: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        z = uv
+        log_det_sum = torch.zeros((uv.shape[0],), device=uv.device, dtype=uv.dtype)
+
         for i, layer in enumerate(self.layers):
-            mask = getattr(self, f'mask_{i}')
-            
-            idx_A = torch.nonzero(mask).squeeze()
-            idx_B = torch.nonzero(1 - mask).squeeze()
-            
-            x_a = z[:, idx_A].unsqueeze(1)  # Conditioning dimension
-            x_b = z[:, idx_B].unsqueeze(1)  # Transformed dimension
-            
-            # Get flow parameters from conditioning dim
-            W, V = layer.get_params(x_a)
-            
-            # Transform
-            y_b, log_det = layer.forward(x_b, W, V)
-            
-            # Update
-            z_new = z.clone()
-            z_new[:, idx_B] = y_b.squeeze(1)
-            z = z_new
-            log_det_sum = log_det_sum + log_det.squeeze()
-        
-        return log_det_sum
-    
-    def sample(self, num_samples: int, condition: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample from the flow given conditioning.
-        
-        Args:
-            num_samples: Number of samples (should match condition batch size)
-            condition: Conditioning from ConditioningNetwork (N, conditioning_dim)
-            
-        Returns:
-            samples: Points in [0,1]^2 (N, 2)
-            log_prob: Log probability of samples (N,)
-        """
-        device = condition.device
-        z = torch.rand((num_samples, 2), device=device)
-        
-        # Inverse pass through layers
+            mask = getattr(self, f"mask_{i}")
+
+            if mask[0] == 1.0:
+                xa = z[:, 0:1]
+                xb = z[:, 1:2]
+                dim_b = 1
+            else:
+                xa = z[:, 1:2]
+                xb = z[:, 0:1]
+                dim_b = 0
+
+            yb, log_det = layer.forward(xb, xa, cond)
+
+            z = z.clone()
+            z[:, dim_b:dim_b + 1] = yb
+            log_det_sum = log_det_sum + log_det.squeeze(-1)
+
+        return log_det_sum  # base is uniform => log p = sum log det
+
+    def sample_uv(self, n: int, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        z = torch.rand((n, 2), device=cond.device, dtype=cond.dtype)
+        log_det_sum = torch.zeros((n,), device=cond.device, dtype=cond.dtype)
+
         for i in reversed(range(len(self.layers))):
             layer = self.layers[i]
-            mask = getattr(self, f'mask_{i}')
-            
-            idx_A = torch.nonzero(mask).squeeze()
-            idx_B = torch.nonzero(1 - mask).squeeze()
-            
-            x_a = z[:, idx_A].unsqueeze(1)
-            z_b = z[:, idx_B].unsqueeze(1)
-            
-            W, V = layer.get_params(x_a)
-            x_b = layer.inverse(z_b, W, V)
-            
-            z_new = z.clone()
-            z_new[:, idx_B] = x_b.squeeze(1)
-            z = z_new
-        
-        # Compute log prob of samples
-        log_prob = self.forward(z, condition)
-        
-        return z, log_prob
+            mask = getattr(self, f"mask_{i}")
 
+            if mask[0] == 1.0:
+                xa = z[:, 0:1]
+                zb = z[:, 1:2]
+                dim_b = 1
+            else:
+                xa = z[:, 1:2]
+                zb = z[:, 0:1]
+                dim_b = 0
+
+            xb, log_det = layer.inverse(zb, xa, cond)
+
+            z = z.clone()
+            z[:, dim_b:dim_b + 1] = xb
+            log_det_sum = log_det_sum + log_det.squeeze(-1)
+
+        return z, log_det_sum
+
+
+# ======================================================================================
+# Optional selection network c(x)
+# ======================================================================================
+
+class SelectionNetwork(nn.Module):
+    def __init__(self, cfg: NISConfig):
+        super().__init__()
+        # Uses same raw 7D input (pos01, wi01, rough01), predicts c in (0,1)
+        in_dim = 7
+        h = cfg.selection_hidden
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, h),
+            nn.ReLU(),
+            nn.Linear(h, h),
+            nn.ReLU(),
+            nn.Linear(h, 1),
+        )
+
+    def forward(self, x01: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.net(x01)).squeeze(-1)
+
+
+# ======================================================================================
+# Guiding distribution
+# ======================================================================================
 
 class NISGuidingDistribution(GuidingDistribution):
-    """Path guiding using Neural Importance Sampling.
-    
-    Uses normalizing flows to learn the importance distribution directly,
-    rather than approximating with a mixture model (like vMF).
-    
-    Advantages over vMF:
-    - More expressive (can represent arbitrary distributions)
-    - Better for complex lighting (caustics, intricate shadows)
-    
-    Disadvantages:
-    - Slower training and inference
-    - More parameters
-    """
-    
     def __init__(self, config: Optional[NISConfig] = None):
-        config = config or NISConfig()
-        super().__init__(config)
-        self.nis_config = config
-        
-        # Build the flow
-        self.flow = NISFlow(config).to(self.device)
-        
-        # Optimizer
-        self.optimizer = torch.optim.Adam(
-            self.flow.parameters(),
-            lr=config.learning_rate
+        cfg = config or NISConfig()
+        super().__init__(cfg)
+        self.cfg = cfg
+
+        self.flow = NISFlow(cfg).to(self.device)
+
+        self.selection = SelectionNetwork(cfg).to(self.device) if cfg.learn_selection else None
+
+        params = list(self.flow.parameters()) + (list(self.selection.parameters()) if self.selection is not None else [])
+        self.optimizer = torch.optim.Adam(params, lr=cfg.learning_rate)
+
+        self._logJ = math.log(jacobian_hemi())
+
+        logger.info(
+            f"NIS initialized: L={cfg.num_coupling_layers}, K={cfg.num_bins}, "
+            f"div={cfg.divergence}, learn_selection={cfg.learn_selection}, "
+            f"use_logged_c={cfg.use_logged_bsdf_fraction}"
         )
-        
-        logger.info(f"NIS Guiding Distribution initialized with {config.num_coupling_layers} layers")
-    
+
     @property
     def name(self) -> str:
-        return "Neural Importance Sampling"
-    
-    def _direction_to_uv(self, direction: torch.Tensor) -> torch.Tensor:
-        """Convert 3D direction to [0,1]^2 UV coordinates.
-        
-        Uses equal-area spherical mapping for uniform sampling.
-        """
-        # Normalize direction
-        direction = F.normalize(direction, dim=-1)
-        
-        # Spherical coordinates
-        # theta = arccos(z), phi = atan2(y, x)
-        theta = torch.acos(direction[:, 2].clamp(-1, 1))  # [0, pi]
-        phi = torch.atan2(direction[:, 1], direction[:, 0])  # [-pi, pi]
-        
-        # Map to [0, 1]
-        u = theta / torch.pi
-        v = (phi + torch.pi) / (2 * torch.pi)
-        
-        return torch.stack([u, v], dim=1)
-    
-    def _uv_to_direction(self, uv: torch.Tensor) -> torch.Tensor:
-        """Convert [0,1]^2 UV coordinates to 3D direction."""
-        u, v = uv[:, 0], uv[:, 1]
-        
-        theta = u * torch.pi
-        phi = v * 2 * torch.pi - torch.pi
-        
-        sin_theta = torch.sin(theta)
-        x = sin_theta * torch.cos(phi)
-        y = sin_theta * torch.sin(phi)
-        z = torch.cos(theta)
-        
-        return torch.stack([x, y, z], dim=1)
-    
-    def _uv_jacobian(self, uv: torch.Tensor) -> torch.Tensor:
-        """Jacobian of the UV -> direction mapping (for PDF correction)."""
-        u = uv[:, 0]
-        theta = u * torch.pi
-        # Jacobian is sin(theta) * pi * 2*pi = 2*pi^2 * sin(theta)
-        return 2 * (torch.pi ** 2) * torch.sin(theta).clamp(min=1e-8)
-    
-    def sample(
-        self,
-        position: torch.Tensor,
-        wi: torch.Tensor,
-        roughness: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample directions from the NIS flow."""
+        return "Neural Importance Sampling (MIS-aware)"
+
+    def _pos_to_01(self, position_ws: torch.Tensor) -> torch.Tensor:
+        if self.bbox_min is None or self.bbox_max is None:
+            raise RuntimeError(f"{self.name}: Scene bbox not set. Call set_scene(scene) first.")
+        extent = (self.bbox_max - self.bbox_min)
+        extent = torch.where(extent < 1e-6, torch.ones_like(extent), extent)
+        pos01 = (position_ws - self.bbox_min) / extent
+        return pos01.clamp(0.0, 1.0)
+
+    def _wi_to_01(self, wi: torch.Tensor) -> torch.Tensor:
+        wi = F.normalize(wi, dim=-1)
+        return ((wi + 1.0) * 0.5).clamp(0.0, 1.0)
+
+    def _rough_to_01(self, roughness: torch.Tensor) -> torch.Tensor:
+        if roughness.ndim == 1:
+            roughness = roughness.unsqueeze(1)
+        return roughness.clamp(0.0, 1.0)
+
+    def _cond(self, position_ws: torch.Tensor, wi: torch.Tensor, roughness: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        pos01 = self._pos_to_01(position_ws)
+        wi01 = self._wi_to_01(wi)
+        r01 = self._rough_to_01(roughness)
+        cond = self.flow.conditioning(pos01, wi01, r01)
+        x01 = torch.cat([pos01, wi01, r01], dim=1)  # for selection net
+        return cond, x01
+
+    # ----- API -----
+
+    def sample(self, position: torch.Tensor, wi: torch.Tensor, roughness: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         self.flow.eval()
-        
         with torch.no_grad():
-            # Get conditioning
-            condition = self.flow.conditioning(position, wi, roughness)
-            
-            # Sample UV coordinates
-            uv, log_prob_uv = self.flow.sample(position.shape[0], condition)
-            
-            # Convert to directions
-            directions = self._uv_to_direction(uv)
-            
-            # Convert log prob (account for Jacobian)
-            jacobian = self._uv_jacobian(uv)
-            pdf_values = torch.exp(log_prob_uv) / jacobian
-            
-        return directions, pdf_values
-    
-    # Alias for compatibility with PathGuidingIntegrator
-    def sample_guided_direction(
-        self,
-        position: torch.Tensor,
-        wi: torch.Tensor,
-        roughness: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Alias for sample() for API compatibility."""
-        return self.sample(position, wi, roughness)
-    
-    def pdf(
-        self,
-        position: torch.Tensor,
-        wi: torch.Tensor,
-        wo: torch.Tensor,
-        roughness: torch.Tensor
-    ) -> torch.Tensor:
-        """Evaluate PDF for given directions."""
+            cond, _ = self._cond(position, wi, roughness)
+            uv, logp_uv = self.flow.sample_uv(position.shape[0], cond)
+            wo = uv_to_dir_hemi(uv)
+            pdf = torch.exp(logp_uv - self._logJ)
+            return wo, pdf
+
+    def pdf(self, position: torch.Tensor, wi: torch.Tensor, wo: torch.Tensor, roughness: torch.Tensor) -> torch.Tensor:
         self.flow.eval()
-        
         with torch.no_grad():
-            # Get conditioning
-            condition = self.flow.conditioning(position, wi, roughness)
-            
-            # Convert direction to UV
-            uv = self._direction_to_uv(wo)
-            
-            # Get log prob
-            log_prob_uv = self.flow.forward(uv, condition)
-            
-            # Convert to PDF (account for Jacobian)
-            jacobian = self._uv_jacobian(uv)
-            pdf = torch.exp(log_prob_uv) / jacobian
-            
-        return pdf
-    
-    def log_pdf(
-        self,
-        position: torch.Tensor,
-        wi: torch.Tensor,
-        wo: torch.Tensor,
-        roughness: torch.Tensor
-    ) -> torch.Tensor:
-        """Evaluate log PDF for given directions."""
+            # If wo is below hemisphere, pdf = 0
+            below = wo[:, 2] <= 0.0
+            cond, _ = self._cond(position, wi, roughness)
+            uv = dir_to_uv_hemi(wo, eps=self.cfg.epsilon)
+            logp_uv = self.flow.forward_logprob_uv(uv, cond)
+            pdf = torch.exp(logp_uv - self._logJ)
+            pdf = torch.where(below, torch.zeros_like(pdf), pdf)
+            return pdf
+
+    def log_pdf(self, position: torch.Tensor, wi: torch.Tensor, wo: torch.Tensor, roughness: torch.Tensor) -> torch.Tensor:
         self.flow.eval()
-        
         with torch.no_grad():
-            condition = self.flow.conditioning(position, wi, roughness)
-            uv = self._direction_to_uv(wo)
-            log_prob_uv = self.flow.forward(uv, condition)
-            jacobian = self._uv_jacobian(uv)
-            return log_prob_uv - torch.log(jacobian)
-    
+            below = wo[:, 2] <= 0.0
+            cond, _ = self._cond(position, wi, roughness)
+            uv = dir_to_uv_hemi(wo, eps=self.cfg.epsilon)
+            logp_uv = self.flow.forward_logprob_uv(uv, cond)
+            logp = logp_uv - self._logJ
+            logp = torch.where(below, torch.full_like(logp, -float("inf")), logp)
+            return logp
+
+    def selection_prob(self, position: torch.Tensor, wi: torch.Tensor, roughness: torch.Tensor) -> torch.Tensor:
+        """Optional: learned c(x) in [0,1]. If disabled, returns constant 0.5."""
+        if self.selection is None:
+            return torch.full((position.shape[0],), 0.5, device=self.device)
+        self.selection.eval()
+        with torch.no_grad():
+            _, x01 = self._cond(position, wi, roughness)
+            return self.selection(x01)
+
+    # ----- Training -----
+
     def train_step(self, batch: TrainingBatch) -> float:
-        """Train the NIS flow using importance-weighted KL divergence."""
         if not batch.is_valid():
             return -1.0
-        
-        # Prepare data
-        pos = batch.position_normalized * 2 - 1  # [0,1] -> [-1,1]
-        wo = batch.wo
+
+        # Required signals
+        pos = batch.position
         wi = batch.wi
-        roughness = batch.roughness
-        radiance = batch.radiance_rgb.mean(dim=1)  # Luminance as importance weight
-        
+        wo = batch.wo
+        rough = batch.roughness
+
+        combined_pdf = batch.combined_pdf
+        rad = batch.radiance_scalar
+
+        # Optional fields (should be present in your updated TrainingBatch)
+        bsdf_pdf = getattr(batch, "bsdf_pdf", None)
+        bsdf_frac_logged = getattr(batch, "bsdf_fraction", None)
+        is_delta = getattr(batch, "is_delta", None)
+        guiding_active = getattr(batch, "guiding_active", None)
+
+        # Basic validation
+        if combined_pdf is None or rad is None:
+            return -1.0
+
+        # Filter invalid samples
+        valid = torch.isfinite(pos).all(dim=1) & torch.isfinite(wi).all(dim=1) & torch.isfinite(wo).all(dim=1)
+        valid &= torch.isfinite(combined_pdf) & (combined_pdf > 0)
+        valid &= torch.isfinite(rad)
+
+        if is_delta is not None and is_delta.numel() == rad.numel():
+            valid &= (~is_delta.bool())  # skip delta vertices
+
+        if guiding_active is not None and guiding_active.numel() == rad.numel():
+            # optional: focus training only when guiding was active in integrator
+            valid &= guiding_active.bool()
+
+        if valid.sum().item() == 0:
+            return -1.0
+
+        pos = pos[valid]
+        wi = wi[valid]
+        wo = wo[valid]
+        rough = rough[valid]
+        combined_pdf = combined_pdf[valid]
+        rad = rad[valid]
+
+        if bsdf_pdf is not None and bsdf_pdf.numel() == batch.num_samples:
+            bsdf_pdf = bsdf_pdf[valid]
+        else:
+            bsdf_pdf = None
+
+        if bsdf_frac_logged is not None and bsdf_frac_logged.numel() == batch.num_samples:
+            bsdf_frac_logged = bsdf_frac_logged[valid]
+        else:
+            bsdf_frac_logged = None
+
+        # Random minibatch
+        n = pos.shape[0]
+        B = min(int(self.cfg.batch_size), n)
+        idx = torch.randint(0, n, (B,), device=pos.device)
+
+        pos = pos[idx].contiguous()
+        wi = wi[idx].contiguous()
+        wo = wo[idx].contiguous()
+        rough = rough[idx].contiguous()
+        combined_pdf = combined_pdf[idx].contiguous()
+        rad = rad[idx].contiguous()
+        if bsdf_pdf is not None:
+            bsdf_pdf = bsdf_pdf[idx].contiguous()
+        if bsdf_frac_logged is not None:
+            bsdf_frac_logged = bsdf_frac_logged[idx].contiguous()
+
+        # Importance weights: w = f / r, where r is the pdf that generated wo (combined_pdf)
+        denom = combined_pdf.clamp(min=self.cfg.epsilon)
+        rad = rad.clamp(min=0.0, max=self.cfg.max_radiance)
+        w = (rad / denom).clamp(max=self.cfg.max_weight).detach()
+        w = w / (w.mean().clamp_min(self.cfg.epsilon))  # normalize for stability
+
+        # Compute q_guide at wo
         self.flow.train()
-        
-        # Get conditioning
-        condition = self.flow.conditioning(pos, wi, roughness)
-        
-        # Convert directions to UV
-        uv = self._direction_to_uv(wo)
-        
-        # Forward pass to get log probability
-        log_prob = self.flow.forward(uv, condition)
-        
-        # Account for Jacobian
-        jacobian = self._uv_jacobian(uv)
-        log_pdf = log_prob - torch.log(jacobian)
-        
-        # Importance-weighted negative log-likelihood
-        # Weight by radiance (higher radiance = more important to model correctly)
-        weight = radiance.clamp(max=10.0)  # Clamp to prevent outliers
-        loss = -(weight * log_pdf).mean()
-        
-        # Backward pass
-        self.optimizer.zero_grad()
+        if self.selection is not None:
+            self.selection.train()
+
+        cond, x01 = self._cond(pos, wi, rough)
+        uv = dir_to_uv_hemi(wo, eps=self.cfg.epsilon)
+        log_q_uv = self.flow.forward_logprob_uv(uv, cond)
+        log_q_guide = log_q_uv - self._logJ
+        q_guide = torch.exp(log_q_guide).clamp(min=self.cfg.epsilon)
+
+        # Choose mixture coefficient c
+        if self.selection is not None and self.cfg.learn_selection:
+            c = self.selection(x01).clamp(self.cfg.epsilon, 1.0 - self.cfg.epsilon)
+        else:
+            if self.cfg.use_logged_bsdf_fraction and bsdf_frac_logged is not None:
+                c = bsdf_frac_logged.clamp(0.0, 1.0)
+            else:
+                c = torch.full((B,), 0.5, device=self.device)
+
+        # Form q_eff if bsdf_pdf exists; otherwise train q_guide only
+        if bsdf_pdf is not None:
+            p_bsdf = bsdf_pdf.clamp(min=self.cfg.epsilon)
+            q_eff = (c * p_bsdf + (1.0 - c) * q_guide).clamp(min=self.cfg.epsilon)
+            log_q_eff = torch.log(q_eff)
+        else:
+            log_q_eff = log_q_guide
+
+        # Loss (paper-style weighted objective)
+        if self.cfg.divergence == "kl":
+            loss = -(w * log_q_eff).mean()
+        else:
+            loss = -((w * w) * log_q_eff).mean()
+
+        if not torch.isfinite(loss):
+            return -1.0
+
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.flow.parameters(), max_norm=1.0)
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            list(self.flow.parameters()) + (list(self.selection.parameters()) if self.selection is not None else []),
+            self.cfg.grad_clip_norm
+        )
+        if not torch.isfinite(grad_norm):
+            return -1.0
+
         self.optimizer.step()
-        
-        return loss.item()
-    
-    # Alias for compatibility with visualize.py
-    def train_step_from_batch(self, batch: TrainingBatch) -> float:
-        """Alias for train_step for API compatibility."""
-        return self.train_step(batch)
-    
-    def get_distribution_for_visualization(
-        self,
-        position: torch.Tensor,
-        wi: torch.Tensor,
-        roughness: torch.Tensor
-    ) -> "NISGuidingDistribution":
-        """Return self - visualization uses pdf() directly."""
-        # Store context for pdf calls during visualization
+        return float(loss.item())
+
+    def get_distribution_for_visualization(self, position: torch.Tensor, wi: torch.Tensor, roughness: torch.Tensor) -> "NISGuidingDistribution":
         self._vis_position = position
         self._vis_wi = wi
         self._vis_roughness = roughness
         return self
-
-
-# Remove NISVisualization class - not needed anymore

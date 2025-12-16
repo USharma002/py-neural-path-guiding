@@ -32,7 +32,7 @@ class SphericalCamera(mi.Sensor):
         return super().sample_direction(it, sample, active)
 
 
-# Register the new, corrected sensor
+# Register the new sensor
 mi.register_sensor("spherical", lambda props: SphericalCamera(props))
 
 class GTSphericalCamera(SphericalCamera):
