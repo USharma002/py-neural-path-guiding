@@ -1,6 +1,6 @@
-drjit==0.4.4
+drjit==1.2.0
 matplotlib==3.10.7
-mitsuba==3.5.0
+mitsuba==3.7.1
 numba==0.62.0
 numpy==2.3.5
 Pillow==12.0.0
