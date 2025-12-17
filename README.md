@@ -68,7 +68,7 @@ Planned or in-progress work includes:
 - Expanded Neural Radiance Cache pipeline (WIP)
 - Improved visualization and debugging tools (added training data visualization)
 - Example scripts and notebooks for experiments
-- Speed Improvements (Implement using new Drjit Neural Networks)
+- Speed Improvements (will try to Implement using new Drjit Neural Networks)
 
 ---
 
