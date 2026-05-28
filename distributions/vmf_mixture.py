@@ -272,14 +272,7 @@ class BatchedMixedSphericalGaussianDistribution(nn.Module):
         row_sums = weights.sum(dim=1)
         n_zero_rows = (row_sums <= 1e-12).sum().item()
 
-        # if n_nan or n_inf or n_neg or n_zero_rows:
-        #     print("=== BatchedMixedSphericalGaussianDistribution.sample() DIAGNOSTIC ===")
-        #     print(f"weights shape: {weights.shape} device: {weights.device}")
-        #     print(f"n_nan: {n_nan}, n_inf: {n_inf}, n_neg: {n_neg}, n_zero_rows: {n_zero_rows}")
-        #     print(f"row_sums.min: {float(row_sums.min()) if row_sums.numel() else 'N/A'}, row_sums.max: {float(row_sums.max()) if row_sums.numel() else 'N/A'}")
-        #     # print the first few rows (move to CPU for safety)
-        #     print("weights[0:6]:\n", weights[:6].detach().cpu().numpy())
-        #     print("=====================================================================")
+
 
         # Fix NaN/Inf: replace with zeros (we'll restore uniform if entire row zero)
         weights = torch.where(torch.isfinite(weights), weights, torch.zeros_like(weights))

@@ -28,7 +28,7 @@ class SphericalCamera(mi.Sensor):
         return mi.RayDifferential3f(ray), weight
 
     def sample_direction(self, it, sample, active=True):
-        # This function will not be correct, but it won't be used by a standard path tracer.
+        # Fallback to base implementation; not used in standard path tracing.
         return super().sample_direction(it, sample, active)
 
 

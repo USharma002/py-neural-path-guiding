@@ -161,12 +161,7 @@ def prepare_shared_training_data(
     radiance_nee = _get_attr_torch(rec, "radiance_nee", device)
     direction_nee = _get_attr_torch(rec, "direction_nee", device, transpose_if_matrix3=False)
 
-    # If you don’t store these yet, they’ll just be empty and you can fill later. (was needed for NIS implementation)
-    guide_pdf = torch.empty((num_samples,), device=device)
-    sample_source = torch.empty((num_samples,), device=device, dtype=torch.int8)
-    bsdf_fraction = torch.empty((num_samples,), device=device)
-
-    # Roughness placeholder (or replace with a real roughness field you store)Dummy for now
+    # Fallback to default roughness of 1.0 if not present in the record
     roughness = torch.ones((num_samples, 1), device=device)
 
     # Apply max_samples if requested (simple truncation)

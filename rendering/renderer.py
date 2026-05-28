@@ -147,7 +147,6 @@ class Renderer:
 
 
 if __name__ == "__main__":
-	import matplotlib.pyplot as plt
 	cbox = mi.cornell_box()
 	cbox['integrator']['max_depth'] = 5
 	cbox['integrator']['rr_depth'] = 5
@@ -156,8 +155,6 @@ if __name__ == "__main__":
 	cbox['sensor']['film']['height'] = 400
 
 	scene = mi.load_dict(cbox)
-	
-	# We create one instance of the renderer to use.
 	renderer_instance = Renderer()
 
 	integrator = mi.load_dict({
@@ -168,27 +165,19 @@ if __name__ == "__main__":
 	num_rays = cbox['sensor']['film']['width'] * cbox['sensor']['film']['height']
 	logger.info(f"Setting up integrator for a wavefront of {num_rays} rays.")
 	integrator.setup(
+		scene=scene,
 		num_rays=num_rays,
 		bbox_min=scene.bbox().min,
 		bbox_max=scene.bbox().max
 	)
-
-	# integrator.set_guiding( False )
+	integrator.set_guiding(True)
 
 	logger.info("Starting render process...")
 	start_time = time.time()
-	
-	# This call will now be fast and stable, even with high SPP
-	# Note: We pass guiding=False for this example to test the vanilla PT performance
 	img = renderer_instance.render(scene, spp=cbox['sensor']['sampler']['sample_count'], integrator=integrator).cpu().numpy()
-	
 	end_time = time.time()
 	logger.info(f"Total rendering time: {end_time - start_time:.2f} seconds.")
 
 	if hasattr(integrator, 'nrc_system'):
 		loss = integrator.nrc_system.train_step(integrator)
 		logger.info(f"NRC Loss: {loss}")
-	
-	# plt.imshow(img ** (1. / 2.2))
-	# plt.axis("off")
-	# plt.show()

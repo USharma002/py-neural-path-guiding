@@ -197,6 +197,12 @@ class NeuralRadianceCache(nn.Module):
 
     # -------------------- Training --------------------
 
+    def train_step(self, integrator) -> float:
+        """Perform one training step using data from the integrator."""
+        from guiding.training_data import prepare_shared_training_data
+        batch = prepare_shared_training_data(integrator, device=self.device)
+        return self.train_step_from_batch(batch)
+
     def train_step_from_batch(self, batch: TrainingBatch) -> float:
         """
         Train step using your shared TrainingBatch.

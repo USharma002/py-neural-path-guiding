@@ -1,6 +1,4 @@
-# app.py
-#
-# Most of is it generated using Copilot as GUI was not the main focus.
+"""PyQt-based GUI application for path guiding visualization and scene inspection."""
 
 import os
 import random
@@ -32,6 +30,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QMessageBox,
     QProgressDialog,
+    QStackedWidget,
 )
 
 try:
@@ -45,52 +44,13 @@ from guiding.config import get_config, get_logger, FPSProfiler, VisualizerConfig
 from rendering.renderer import Renderer
 from guiding.training_data import prepare_shared_training_data
 
-# ---- robust helper import (project uses multiple names across files) ----
-def _import_vis_helpers():
-    try:
-        from utils.visualization_helpers import (
-            visualize_pdf_on_sphere_html,
-            plot_nrc_radiance,
-            plot_guiding_distribution,
-            numpy_to_qpixmap,
-            draw_marker_on_image,
-        )
-        return (
-            visualize_pdf_on_sphere_html,
-            plot_nrc_radiance,
-            plot_guiding_distribution,
-            numpy_to_qpixmap,
-            draw_marker_on_image,
-        )
-    except Exception:
-        pass
-
-    try:
-        from visualization_helpers import (
-            visualizepdfonspherehtml,
-            plotnrcradiance,
-            plotguidingdistribution,
-            numpytoqpixmap,
-            drawmarkeronimage,
-        )
-        return (
-            visualizepdfonspherehtml,
-            plotnrcradiance,
-            plotguidingdistribution,
-            numpytoqpixmap,
-            drawmarkeronimage,
-        )
-    except Exception:
-        raise
-
-
-(
+from utils.visualization_helpers import (
     visualize_pdf_on_sphere_html,
     plot_nrc_radiance,
     plot_guiding_distribution,
     numpy_to_qpixmap,
     draw_marker_on_image,
-) = _import_vis_helpers()
+)
 
 import sensor.spherical as spherical  # noqa: F401 (registers gt_spherical_camera)
 import guiding.registry as registry
@@ -109,18 +69,19 @@ class GuidingNrcVizWorker(QThread):
     result_ready = pyqtSignal(int, object)  # job_id, dict
     failed = pyqtSignal(int, str)
 
-    def __init__(self, job_id: int, viewer: "MitsubaViewer", si: mi.SurfaceInteraction3f):
+    def __init__(self, job_id: int, viewer: "MitsubaViewer", si: mi.SurfaceInteraction3f, render_sphere: bool):
         super().__init__()
         self.job_id = job_id
         self.viewer = viewer
         self.si = si
+        self.render_sphere = bool(render_sphere)
 
     def run(self):
         try:
             out: Dict[str, Any] = {}
             out["vmf_rgb"] = self.viewer._render_guiding_2d(self.si)
             out["nrc_rgb"] = self.viewer._render_nrc(self.si)
-            if self.viewer._sphere_supported():
+            if self.render_sphere and self.viewer._sphere_supported():
                 out["vmf_html"] = self.viewer._render_guiding_sphere_html(self.si)
             else:
                 out["vmf_html"] = ""
@@ -130,15 +91,21 @@ class GuidingNrcVizWorker(QThread):
 
 
 class LossPlotWidget(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, title: str = "Guiding Loss", series: str = "guiding", color: str = "#4cc9f0"):
         super().__init__(parent)
+        self._title = title
+        self._series = series
+        self._color = color
         self._loss: List[float] = []
+        self._nrc_loss: List[float] = []
         self._max_points = 2000
         self.setMinimumSize(256, 256)
         self.setStyleSheet("background-color: #111; border: 1px solid #333;")
 
     def append(self, value: float):
         if value is None:
+            return
+        if self._series != "guiding":
             return
         try:
             v = float(value)
@@ -149,8 +116,23 @@ class LossPlotWidget(QWidget):
             self._loss = self._loss[-self._max_points :]
         self.update()
 
+    def append_nrc(self, value: float):
+        if value is None:
+            return
+        if self._series != "nrc":
+            return
+        try:
+            v = float(value)
+        except Exception:
+            return
+        self._nrc_loss.append(v)
+        if len(self._nrc_loss) > self._max_points:
+            self._nrc_loss = self._nrc_loss[-self._max_points :]
+        self.update()
+
     def clear(self):
         self._loss.clear()
+        self._nrc_loss.clear()
         self.update()
 
     def paintEvent(self, event):
@@ -164,17 +146,22 @@ class LossPlotWidget(QWidget):
         p.drawRect(0, 0, w - 1, h - 1)
 
         p.setPen(QPen(QColor("#aaa"), 1))
-        p.drawText(8, 16, "Loss")
+        p.drawText(8, 16, self._title)
 
-        if len(self._loss) < 2:
+        values = self._loss if self._series == "guiding" else self._nrc_loss
+
+        if len(values) < 2:
             p.setPen(QPen(QColor("#666"), 1))
             p.drawText(8, 34, "No data")
             return
 
-        y = np.asarray(self._loss, dtype=np.float64)
-        y = y[np.isfinite(y)]
-        if y.size < 2:
+        finite_values = [v for v in values if np.isfinite(v)]
+        if len(finite_values) < 2:
+            p.setPen(QPen(QColor("#666"), 1))
+            p.drawText(8, 34, "No data")
             return
+
+        y = np.asarray(finite_values, dtype=np.float64)
 
         y_lo = float(np.percentile(y, 2))
         y_hi = float(np.percentile(y, 98))
@@ -187,35 +174,39 @@ class LossPlotWidget(QWidget):
 
         x0, y0 = 6, 24
         x1, y1 = w - 6, h - 6
-        n = len(self._loss)
-
-        xs = np.linspace(x0, x1, n)
-        yy = np.asarray(self._loss, dtype=np.float64)
-        yy = np.clip(yy, y_lo, y_hi)
-        ys = y1 - (yy - y_lo) / (y_hi - y_lo) * (y1 - y0)
 
         if y_lo < 0.0 < y_hi:
             z = y1 - (0.0 - y_lo) / (y_hi - y_lo) * (y1 - y0)
             p.setPen(QPen(QColor("#444"), 1))
             p.drawLine(int(x0), int(z), int(x1), int(z))
 
-        p.setPen(QPen(QColor("#4cc9f0"), 2))
+        n = len(finite_values)
+        xs = np.linspace(x0, x1, n)
+        yy = np.asarray(finite_values, dtype=np.float64)
+        yy = np.clip(yy, y_lo, y_hi)
+        ys = y1 - (yy - y_lo) / (y_hi - y_lo) * (y1 - y0)
+
+        p.setPen(QPen(QColor(self._color), 2))
         for i in range(n - 1):
             p.drawLine(int(xs[i]), int(ys[i]), int(xs[i + 1]), int(ys[i + 1]))
 
-        p.setPen(QPen(QColor("#bbb"), 1))
-        p.drawText(8, h - 10, f"{float(self._loss[-1]):.6f}")
+        text_y = h - 10
+        if len(finite_values) > 0:
+            label = "G" if self._series == "guiding" else "NRC"
+            p.setPen(QPen(QColor(self._color), 1))
+            p.drawText(8, text_y, f"{label}: {float(finite_values[-1]):.6f}")
 
 
 class ClickVizWorker(QThread):
     result_ready = pyqtSignal(int, object)  # job_id, dict
     failed = pyqtSignal(int, str)
 
-    def __init__(self, job_id: int, viewer: "MitsubaViewer", si: mi.SurfaceInteraction3f):
+    def __init__(self, job_id: int, viewer: "MitsubaViewer", si: mi.SurfaceInteraction3f, render_sphere: bool):
         super().__init__()
         self.job_id = job_id
         self.viewer = viewer
         self.si = si
+        self.render_sphere = bool(render_sphere)
 
     def run(self):
         try:
@@ -226,7 +217,7 @@ class ClickVizWorker(QThread):
             out["vmf_rgb"] = self.viewer._render_guiding_2d(self.si)
             out["nrc_rgb"] = self.viewer._render_nrc(self.si)
 
-            if self.viewer._sphere_supported():
+            if self.render_sphere and self.viewer._sphere_supported():
                 out["vmf_html"] = self.viewer._render_guiding_sphere_html(self.si)
             else:
                 out["vmf_html"] = ""
@@ -396,6 +387,7 @@ class MitsubaViewer(QMainWindow):
         self.realtime_checkbox = QCheckBox("Real-Time Render")
         self.train_realtime_checkbox = QCheckBox("Train in Real-Time")
         self.train_nrc_checkbox = QCheckBox("Train NRC")
+        self.use_nrc_checkbox = QCheckBox("Use NRC")
         self.accumulate_checkbox = QCheckBox("Accumulate Frames")
         self.show_variance_checkbox = QCheckBox("Show Variance")
         self.show_sphere_checkbox = QCheckBox("3D Sphere")
@@ -403,6 +395,7 @@ class MitsubaViewer(QMainWindow):
         self.show_sphere_checkbox.setChecked(True)
         self.bsdf_checkbox.setChecked(True)
         self.use_nee_checkbox.setChecked(False)
+        self.use_nrc_checkbox.setChecked(False)
 
         for w in [
             self.cosine_checkbox,
@@ -412,6 +405,7 @@ class MitsubaViewer(QMainWindow):
             self.realtime_checkbox,
             self.train_realtime_checkbox,
             self.train_nrc_checkbox,
+            self.use_nrc_checkbox,
             self.accumulate_checkbox,
             self.show_variance_checkbox,
             self.show_sphere_checkbox,
@@ -436,7 +430,9 @@ class MitsubaViewer(QMainWindow):
         self.normalized_pdf_view = QLabel("Hemisphere RGB (sRGB)")
         self.vmf_view = QLabel("Guiding Distribution")
         self.nrc_view = QLabel("NRC Radiance")
-        self.loss_plot = LossPlotWidget()
+        self.guiding_loss_plot = LossPlotWidget(title="Guiding Loss", series="guiding", color="#4cc9f0")
+        self.nrc_loss_plot = LossPlotWidget(title="NRC Loss", series="nrc", color="#f77f00")
+        self.loss_plot = self.guiding_loss_plot
 
         for view in [self.hover_view, self.normalized_pdf_view, self.vmf_view, self.nrc_view]:
             view.setMinimumSize(self.HOVER_RESOLUTION[0], self.HOVER_RESOLUTION[1])
@@ -453,12 +449,16 @@ class MitsubaViewer(QMainWindow):
             self.vmf_sphere_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.vmf_sphere_view.setStyleSheet("QLabel { background-color: #000; color: #bbb; border: 1px solid #333; }")
 
+        self.sphere_or_nrc_stack = QStackedWidget()
+        self.sphere_or_nrc_stack.addWidget(self.vmf_sphere_view)
+        self.sphere_or_nrc_stack.addWidget(self.nrc_loss_plot)
+
         detail_grid.addWidget(self.hover_view, 0, 0)
         detail_grid.addWidget(self.normalized_pdf_view, 0, 1)
         detail_grid.addWidget(self.vmf_view, 0, 2)
         detail_grid.addWidget(self.nrc_view, 1, 0)
-        detail_grid.addWidget(self.vmf_sphere_view, 1, 1)
-        detail_grid.addWidget(self.loss_plot, 1, 2)
+        detail_grid.addWidget(self.sphere_or_nrc_stack, 1, 1)
+        detail_grid.addWidget(self.guiding_loss_plot, 1, 2)
 
         vis_layout.addLayout(detail_grid, stretch=3)
         self.main_layout.addLayout(vis_layout)
@@ -487,6 +487,7 @@ class MitsubaViewer(QMainWindow):
         self.bsdf_checkbox.stateChanged.connect(self._on_viz_setting_changed)
         self.guiding_checkbox.stateChanged.connect(lambda: self.re_render_main_image(spp=1))
         self.use_nee_checkbox.stateChanged.connect(self._on_nee_toggled)
+        self.use_nrc_checkbox.stateChanged.connect(self._on_nrc_toggled)
 
         self.realtime_checkbox.stateChanged.connect(self.toggle_realtime_render)
         self.accumulate_checkbox.stateChanged.connect(self._reset_accumulator)
@@ -528,9 +529,9 @@ class MitsubaViewer(QMainWindow):
 
     def _apply_sphere_visibility(self):
         enabled = self.show_sphere_checkbox.isChecked()
-        if self.vmf_sphere_view is None:
+        if self.sphere_or_nrc_stack is None:
             return
-        self.vmf_sphere_view.setVisible(bool(enabled))
+        self.sphere_or_nrc_stack.setCurrentWidget(self.vmf_sphere_view if enabled else self.nrc_loss_plot)
         if enabled and self._sphere_supported() and self._last_sphere_html:
             self.vmf_sphere_view.setHtml(self._last_sphere_html)
 
@@ -580,10 +581,24 @@ class MitsubaViewer(QMainWindow):
         v = bool(getattr(self.integrator, "usenee", False))
         self.use_nee_checkbox.setChecked(v)
 
+    def _store_nee_radiance_enabled(self) -> bool:
+        cfg = get_config()
+        return bool(getattr(getattr(cfg, "integrator", None), "store_nee_radiance", False))
+
     def _on_nee_toggled(self):
         if self.integrator is None:
             return
         setattr(self.integrator, "usenee", bool(self.use_nee_checkbox.isChecked()))
+        if self.scene is not None:
+            self.re_render_main_image(spp=1)
+        self.reprocess_last_click()
+
+    def _on_nrc_toggled(self):
+        if self.integrator is None:
+            return
+        if hasattr(self.integrator, "set_nrc"):
+            self.integrator.set_nrc(bool(self.use_nrc_checkbox.isChecked()))
+        self.re_render_main_image(spp=1)
 
     def load_default_scene(self):
         self.load_scene(scene_path=None)
@@ -614,9 +629,21 @@ class MitsubaViewer(QMainWindow):
             bbox = self.scene.bbox()
 
             try:
-                self.integrator.setup(scene=self.scene, numrays=num_rays, bboxmin=bbox.min, bboxmax=bbox.max)
+                self.integrator.setup(
+                    scene=self.scene,
+                    numrays=num_rays,
+                    bboxmin=bbox.min,
+                    bboxmax=bbox.max,
+                    isStoreNEERadiance=self._store_nee_radiance_enabled(),
+                )
             except TypeError:
-                self.integrator.setup(scene=self.scene, num_rays=num_rays, bbox_min=bbox.min, bbox_max=bbox.max)
+                self.integrator.setup(
+                    scene=self.scene,
+                    num_rays=num_rays,
+                    bbox_min=bbox.min,
+                    bbox_max=bbox.max,
+                    isStoreNEERadiance=self._store_nee_radiance_enabled(),
+                )
 
             self._reset_accumulator()
             self.re_render_main_image(spp=16)
@@ -717,7 +744,7 @@ class MitsubaViewer(QMainWindow):
     # Rendering
     # -------------------------------------------------------------------------
 
-    def _render_one_spp(self, guiding: bool) -> np.ndarray:
+    def _render_one_spp(self, guiding: bool, use_nrc: Optional[bool] = None) -> np.ndarray:
         if self.scene is None:
             return None
 
@@ -727,6 +754,10 @@ class MitsubaViewer(QMainWindow):
             self.integrator.setGuiding(bool(guiding))
         else:
             setattr(self.integrator, "guiding", bool(guiding))
+
+        if hasattr(self.integrator, "set_nrc"):
+            nrc_val = bool(self.use_nrc_checkbox.isChecked()) if use_nrc is None else bool(use_nrc)
+            self.integrator.set_nrc(nrc_val)
 
         with torch.inference_mode():
             img = custom_render(
@@ -805,13 +836,13 @@ class MitsubaViewer(QMainWindow):
         )
 
         dummy_ray = si.spawn_ray(si.n)
-        sensor.world_transform = mi.Transform4f.translate(dummy_ray.o)
+        sensor.world_transform = mi.Transform4f().translate(dummy_ray.o)
         sensor.initial_si = si
 
         sensor.product_bsdf = self.bsdf_checkbox.isChecked()
         sensor.product_cosine = self.cosine_checkbox.isChecked()
 
-        gt_image_np = mi.render(self.scene, sensor=sensor, spp=128).numpy()
+        gt_image_np = mi.render(self.scene, sensor=sensor, spp=16).numpy()
         hemi = np.transpose(gt_image_np, (1, 0, 2)).astype(np.float32)
         return np.clip(hemi, 0.0, 1.0)
 
@@ -856,16 +887,8 @@ class MitsubaViewer(QMainWindow):
             position = si.p.torch()
             normal = si.n.torch()
 
-            bbox_min = None
-            bbox_max = None
-            if hasattr(self.integrator, "bboxmin"):
-                bbox_min = self.integrator.bboxmin.torch().to(device)
-            if hasattr(self.integrator, "bboxmax"):
-                bbox_max = self.integrator.bboxmax.torch().to(device)
-            if bbox_min is None and hasattr(self.integrator, "bbox_min"):
-                bbox_min = self.integrator.bbox_min.torch().to(device)
-            if bbox_max is None and hasattr(self.integrator, "bbox_max"):
-                bbox_max = self.integrator.bbox_max.torch().to(device)
+            bbox_min = getattr(self.nrc_system, "bbox_min", None)
+            bbox_max = getattr(self.nrc_system, "bbox_max", None)
 
             nrc = plot_nrc_radiance(
                 self.nrc_system,
@@ -876,6 +899,8 @@ class MitsubaViewer(QMainWindow):
                 bbox_max=bbox_max,
                 resolution=self.HOVER_RESOLUTION,
                 device=device,
+                display_mode="reinhard",
+                exposure=1.5,
             )
             return np.transpose(nrc, (1, 0, 2)).astype(np.float32)
         except Exception:
@@ -917,7 +942,7 @@ class MitsubaViewer(QMainWindow):
         job_id = self._click_job_id
         self._viz_busy = True
 
-        self._click_worker = ClickVizWorker(job_id, self, si)
+        self._click_worker = ClickVizWorker(job_id, self, si, self.show_sphere_checkbox.isChecked())
         self._click_worker.result_ready.connect(self._on_click_viz_result)
         self._click_worker.failed.connect(self._on_click_viz_failed)
         self._click_worker.start()
@@ -938,7 +963,7 @@ class MitsubaViewer(QMainWindow):
         job_id = self._click_job_id
         self._viz_busy = True
 
-        self._click_worker = ClickVizWorker(job_id, self, self._last_si)
+        self._click_worker = ClickVizWorker(job_id, self, self._last_si, self.show_sphere_checkbox.isChecked())
         self._click_worker.result_ready.connect(self._on_click_viz_result)
         self._click_worker.failed.connect(self._on_click_viz_failed)
         self._click_worker.start()
@@ -981,6 +1006,7 @@ class MitsubaViewer(QMainWindow):
             self.bsdf_checkbox.isChecked(),
             self.cosine_checkbox.isChecked(),
             self.guiding_method_combo.currentText(),
+            self.use_nee_checkbox.isChecked(),
         )
 
     # -------------------------------------------------------------------------
@@ -1008,7 +1034,7 @@ class MitsubaViewer(QMainWindow):
         job_id = self._click_job_id
         self._viz_busy = True
 
-        self._click_worker = GuidingNrcVizWorker(job_id, self, self._last_si)
+        self._click_worker = GuidingNrcVizWorker(job_id, self, self._last_si, self.show_sphere_checkbox.isChecked())
         self._click_worker.result_ready.connect(self._on_guiding_nrc_viz_result)
         self._click_worker.failed.connect(self._on_guiding_nrc_viz_failed)
         self._click_worker.start()
@@ -1062,7 +1088,8 @@ class MitsubaViewer(QMainWindow):
         do_accumulate = self.accumulate_checkbox.isChecked()
 
         try:
-            frame_np = self._render_one_spp(guiding=use_guiding)
+            use_nrc = self.use_nrc_checkbox.isChecked() if not (do_training or do_nrc_training) else False
+            frame_np = self._render_one_spp(guiding=use_guiding, use_nrc=use_nrc)
 
             training_batch = None
             did_train_step = False
@@ -1072,11 +1099,12 @@ class MitsubaViewer(QMainWindow):
 
             if do_training and training_batch is not None and hasattr(self.guiding_system, "train_step_from_batch"):
                 loss = self.guiding_system.train_step_from_batch(training_batch)
-                self.loss_plot.append(loss)
+                self.guiding_loss_plot.append(loss)
                 did_train_step = True
 
             if do_nrc_training and training_batch is not None and hasattr(self.nrc_system, "train_step_from_batch"):
-                _ = self.nrc_system.train_step_from_batch(training_batch)
+                nrc_loss = self.nrc_system.train_step_from_batch(training_batch)
+                self.nrc_loss_plot.append_nrc(nrc_loss)
                 did_train_step = True
 
             if training_batch is not None:
@@ -1102,6 +1130,7 @@ class MitsubaViewer(QMainWindow):
                     self.bsdf_checkbox.isChecked(),
                     self.cosine_checkbox.isChecked(),
                     self.guiding_method_combo.currentText(),
+                    self.use_nee_checkbox.isChecked(),
                 )
 
                 point_or_flags_changed = (
@@ -1200,12 +1229,16 @@ class MitsubaViewer(QMainWindow):
             self.integrator.set_guiding(False)
 
         for i in range(int(iterations)):
-            _ = self._render_one_spp(guiding=False)
+            _ = self._render_one_spp(guiding=False, use_nrc=False)
             batch = prepare_shared_training_data(self.integrator, device=device, max_samples=16384)
 
             if hasattr(self.guiding_system, "train_step_from_batch"):
                 loss = self.guiding_system.train_step_from_batch(batch)
-                self.loss_plot.append(loss)
+                self.guiding_loss_plot.append(loss)
+
+            if self.train_nrc_checkbox.isChecked() and hasattr(self.nrc_system, "train_step_from_batch"):
+                nrc_loss = self.nrc_system.train_step_from_batch(batch)
+                self.nrc_loss_plot.append_nrc(nrc_loss)
 
             # Cache CPU snapshot for UI (VRAM-safe)
             self._cache_training_batch_cpu(batch, current_spp=i + 1)
@@ -1250,7 +1283,8 @@ class MitsubaViewer(QMainWindow):
         elif hasattr(self.guiding_system, "switchMethod"):
             self.guiding_system.switchMethod(method_name)
 
-        self.loss_plot.clear()
+        self.guiding_loss_plot.clear()
+        self.nrc_loss_plot.clear()
         self._reset_accumulator()
         self._last_vis_flags = None
 
@@ -1298,7 +1332,8 @@ class MitsubaViewer(QMainWindow):
                 self.scene, 
                 num_rays=num_rays, 
                 bbox_min=bbox.min, 
-                bbox_max=bbox.max
+                bbox_max=bbox.max,
+                isStoreNEERadiance=self._store_nee_radiance_enabled(),
             )
             self.change_resolution(target_res)
             self._reset_accumulator()
@@ -1399,7 +1434,13 @@ class MitsubaViewer(QMainWindow):
             
             bbox = self.scene.bbox()
             num_rays = original_res[0] * original_res[1]
-            self.integrator.setup(self.scene, num_rays=num_rays, bbox_min=bbox.min, bbox_max=bbox.max)
+            self.integrator.setup(
+                self.scene,
+                num_rays=num_rays,
+                bbox_min=bbox.min,
+                bbox_max=bbox.max,
+                isStoreNEERadiance=self._store_nee_radiance_enabled(),
+            )
 
             self.accumulate_checkbox.setChecked(was_accumulating)
             if hasattr(self.integrator, "set_guiding"):
@@ -1492,7 +1533,7 @@ class MitsubaViewer(QMainWindow):
             progress_bar.setLabelText(f"{desc}: {iters} iters / {elapsed:.1f}s")
             if progress_bar.wasCanceled(): raise InterruptedError()
             
-            frame = self._render_one_spp(guiding=True)
+            frame = self._render_one_spp(guiding=True, use_nrc=False)
             
             if accum_mean is None:
                 accum_mean = np.zeros_like(frame, dtype=np.float32)
@@ -1507,7 +1548,10 @@ class MitsubaViewer(QMainWindow):
             batch = prepare_shared_training_data(self.integrator, device=device, max_samples=16384)
             if batch is not None and hasattr(self.guiding_system, "train_step_from_batch"):
                 loss_val = self.guiding_system.train_step_from_batch(batch)
-                self.loss_plot.append(loss_val)
+                self.guiding_loss_plot.append(loss_val)
+            if batch is not None and self.train_nrc_checkbox.isChecked() and hasattr(self.nrc_system, "train_step_from_batch"):
+                nrc_loss = self.nrc_system.train_step_from_batch(batch)
+                self.nrc_loss_plot.append_nrc(nrc_loss)
             
             iters += 1
             

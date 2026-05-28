@@ -304,11 +304,7 @@ class TrainingDataDialog(QDialog):
         self._height = int(resolution[1])
         self._depth = int(getattr(integrator, "maxdepth", 5)) if integrator is not None else 1
 
-        # Import visualization helper used by viewer (keep same fallback behavior)
-        try:
-            from utils.visualization_helpers import numpy_to_qpixmap as _np2pix
-        except Exception:
-            from visualization_helpers import numpytoqpixmap as _np2pix
+        from utils.visualization_helpers import numpy_to_qpixmap as _np2pix
         self._numpy_to_qpixmap = _np2pix
 
         # Dropdown: (display_name, record_attr_name)

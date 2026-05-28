@@ -15,6 +15,7 @@ from networks.nrc import NeuralRadianceCache
 from guiding.system import PathGuidingSystem
 from rendering.surface_intersection_record import SurfaceInteractionRecord
 from sensor.spherical import GTSphericalCamera
+from utils.math_utils import dirToCanonical
 
 logger = get_logger("integrator")
 
@@ -50,6 +51,8 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
         # Neural Radiance Cache
         self.nrc_system = NeuralRadianceCache(device=DEVICE)
         self.nrc_query_prob: float = props.get('nrc_query_prob', 0.8)
+        self.use_nrc: bool = False
+        self.nrc_min_depth: int = props.get('nrc_min_depth', 2)
 
         # Path Guiding System (uses USE_NIS flag internally)
         self.guiding_system = PathGuidingSystem(device=DEVICE)
@@ -130,8 +133,30 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
         # Change: Set Python bool directly
         self.guiding = bool(guiding_active)
 
+    @property
+    def usenee(self) -> bool:
+        return self.use_nee
+
+    @usenee.setter
+    def usenee(self, value: bool) -> None:
+        self.use_nee = bool(value)
+
+    def set_nrc(self, nrc_active: bool = False) -> None:
+        """Enable or disable Neural Radiance Cache query for early path termination."""
+        self.use_nrc = bool(nrc_active)
+
+    @dr.wrap(source='drjit', target='torch')
+    def query_nrc(self, position: torch.Tensor, normal: torch.Tensor, view_dir: torch.Tensor, roughness: torch.Tensor) -> mi.Spectrum:
+        with torch.no_grad():
+            pred_radiance = self.nrc_system.query(
+                position.T, normal.T, view_dir.T, roughness,
+                bbox_min=self.nrc_system.bbox_min, bbox_max=self.nrc_system.bbox_max
+            )
+            return mi.Spectrum(pred_radiance.T)
+
     def set_iteration(self: mi.SamplingIntegrator, iteration: int) -> None:
         self.iteration = iteration
+
 
     def resetRayPathData(self: mi.SamplingIntegrator) -> None:
         self.surfaceInteractionRecord = dr.zeros(SurfaceInteractionRecord, shape=self.array_size)
@@ -247,6 +272,18 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             si = scene.ray_intersect(ray, ray_flags=mi.RayFlags.All, coherent=depth == 0)
             bsdf = si.bsdf(ray)
 
+            # 0. Optional NRC Query and early termination
+            wi_world = -ray.d
+            wi_local = si.to_local(wi_world)
+
+            active_nrc = mi.Bool(False)
+            if self.use_nrc:
+                active_nrc = active & si.is_valid() & (depth >= self.nrc_min_depth) & (sampler.next_1d(active) < self.nrc_query_prob)
+                roughness_nrc = self._get_roughness(dr.width(ray))
+                nrc_rad = self.query_nrc(si.p, si.n, wi_local, roughness_nrc)
+                L += dr.select(active_nrc, β * nrc_rad, 0.0)
+                active &= ~active_nrc
+
             # 1. Direct Emission
             ds_direct = mi.DirectionSample3f(scene, si=si, ref=prev_si)
             emitter_pdf = scene.pdf_emitter_direction(prev_si, ds_direct, ~prev_bsdf_delta)
@@ -257,8 +294,8 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             else:
                 mis_bsdf_light = mi.Float(1.0)
             
-            Le = β * mis_bsdf_light * raw_Le
-            active_next = (depth + 1 < self.max_depth) & si.is_valid()
+            Le = dr.select(active, β * mis_bsdf_light * raw_Le, 0.0)
+            active_next = active & (depth + 1 < self.max_depth) & si.is_valid()
 
             # 2. BSDF Sampling
             bsdf_sample, bsdf_weight = bsdf.sample(bsdf_ctx, si, sampler.next_1d(), sampler.next_2d(), active_next)
@@ -267,11 +304,12 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             woPdf = mi.Float(bsdf_pdf)
             wo_local = mi.Vector3f(bsdf_sample.wo)
             wo_world = si.to_world(wo_local)
-            wi_world = -ray.d
-            wi_local = si.to_local(wi_world)
             delta = mi.has_flag(bsdf_sample.sampled_type, mi.BSDFFlags.Delta)
 
             # 3. Emitter Sampling (NEE)
+            Lnee = mi.Color3f(0.0)
+            dir_nee = mi.Vector2f(0.0)
+
             is_smooth = mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
             active_em = active_next & is_smooth & self.use_nee
             Lr_dir = mi.Spectrum(0)
@@ -282,20 +320,17 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
                 wo_em = si.to_local(ds.d)
                 bsdf_value_em, bsdf_pdf_em = bsdf.eval_pdf(bsdf_ctx, si, wo_em, active_em)
 
-                # --- Change: Conditional Torch Call ---
-                # Only calculate guiding PDF if the Python flag is TRUE
-                guiding_pdf_em = mi.Float(0.0)
-                if self.guiding:
-                    guiding_pdf_em = self.guiding_pdf(si.p, wi_local, si.n, wo_em)
-                    guiding_pdf_em = dr.select(active_em, guiding_pdf_em, 0.0)
-                
-                # Combine PDFs
+                # Keep NEE MIS on the BSDF PDF only here.
+                # The guiding PDF is still used in the BSDF/guiding sampling branch below,
+                # but calling it inside this emitter-sampling symbolic path triggers a Dr.Jit
+                # custom-op evaluation error when NEE and guiding are enabled together.
                 pdf_hemisphere_em = bsdf_pdf_em
-                if self.guiding:
-                    pdf_hemisphere_em = (self.bsdfSamplingFraction * bsdf_pdf_em) + ((1 - self.bsdfSamplingFraction) * guiding_pdf_em)
                 
                 mis_em = dr.select(ds.delta, mi.Float(1.0), mis_weight(ds.pdf, pdf_hemisphere_em))
                 Lr_dir = dr.select(active_em, β * mis_em * bsdf_value_em * em_weight, 0.0)
+
+                Lnee = mis_em * bsdf_value_em * em_weight
+                dir_nee = dirToCanonical(ds.d)
 
 
             # 4. BSDF or Guiding Sampling
@@ -375,6 +410,10 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             dr.scatter(self.surfaceInteractionRecord.guidingActive, value=guiding_enabled_jit, index=globalIndex, active=storeFlag)
             dr.scatter(self.surfaceInteractionRecord.depth, value=mi.UInt32(depth), index=globalIndex, active=storeFlag)
 
+            if self.isStoreNEERadiance:
+                dr.scatter(self.surfaceInteractionRecord.radiance_nee, value=Lnee, index=globalIndex, active=storeFlag & active_em)
+                dr.scatter(self.surfaceInteractionRecord.direction_nee, value=dir_nee, index=globalIndex, active=storeFlag & active_em)
+
             wo_pred = wo_world
             ray = si.spawn_ray(wo_pred)
             η *= bsdf_sample.eta
@@ -392,7 +431,7 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
             rr_continue = sampler.next_1d() < rr_prob
             active_next &= ~rr_active | rr_continue
             
-            depth[si.is_valid()] += 1
+            depth[active & si.is_valid()] += 1
             active = active_next
 
         dr.schedule(L)
@@ -414,5 +453,5 @@ class PathGuidingIntegrator(mi.SamplingIntegrator):
         return (L, depth!= 0, aov_list)
 
 
-# PathGuidingIntegrator.sample = sample
+
 mi.register_integrator("path_guiding_integrator", lambda props: PathGuidingIntegrator(props))

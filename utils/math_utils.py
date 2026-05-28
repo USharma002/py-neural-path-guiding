@@ -204,11 +204,6 @@ def canonicalToDir(p: mi.Vector2f) -> mi.Vector3f:
     dir.y = sinTheta * sinPhi
     dir.z = cosTheta
 
-    #   Phi: xz, CosTheta: y
-    # dir.x = sinTheta * cosPhi
-    # dir.z = sinTheta * sinPhi
-    # dir.y = cosTheta
-
     return dir
 
 def dirToCanonical(d: mi.Vector3f) -> mi.Vector2f:
@@ -223,13 +218,7 @@ def dirToCanonical(d: mi.Vector3f) -> mi.Vector2f:
     cosTheta = dr.clip( d.z, -1, 1 )
     phi = dr.atan2(d.y, d.x)
 
-    #   Phi: xz, CosTheta: y
-    # cosTheta = dr.clip( d.y, -1, 1 )
-    # phi = dr.atan2(d.z, d.x)
-
-    loop = mi.Loop("rotate phi", lambda: (phi))
-    while loop( phi < 0 ):
-        phi += 2.0 * dr.pi
+    phi = dr.select(phi < 0.0, phi + 2.0 * math.pi, phi)
 
     p = mi.Vector2f(0)
     p.x = phi / dr.two_pi

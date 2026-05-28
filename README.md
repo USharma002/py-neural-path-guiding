@@ -37,6 +37,30 @@ It also includes a PyQt-based GUI viewer for inspecting Mitsuba scene renders, v
 
 ---
 
+## Quickstart
+
+1. Create and activate a Python environment.
+2. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Run the viewer:
+
+```bash
+python main.py
+```
+
+Notes:
+- The project expects a CUDA-capable setup for the main rendering and training paths.
+- 3D sphere visualization is optional and depends on `PyQt6-WebEngine` support in your environment.
+
+---
+
+
+---
+
 ## Project Structure
 
 The repository is organized into the following key modules:
