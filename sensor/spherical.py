@@ -1,41 +1,13 @@
-import mitsuba as mi
+"""Sensor that renders the full sphere of directions seen from a surface point (the hemisphere panel)."""
 import drjit as dr
-import torch
+import mitsuba as mi
+
 mi.set_variant("cuda_ad_rgb")
 
-class SphericalCamera(mi.Sensor):
-    def __init__(self, props=mi.Properties()):
-        super().__init__(props)
 
-    def sample_ray(self, time, wavelength_sample, position_sample, aperture_sample, active=True):
-        wavelengths, wav_weight = self.sample_wavelengths(dr.zeros(mi.SurfaceInteraction3f),
-                                                          wavelength_sample, active)
+class GTSphericalCamera(mi.Sensor):
+    """Equal-area image of incident radiance at initial_si, optionally times the BSDF and/or cosine."""
 
-        o = self.world_transform.translation()
-
-        film_size = mi.Vector2f(self.film().crop_size())
-        half_pixel_offset = 0.5 / film_size
-        corrected_position_sample = position_sample - half_pixel_offset
-
-        d = mi.warp.square_to_uniform_sphere(corrected_position_sample)
-
-        d = dr.normalize(d)
-
-        return mi.Ray3f(o, d, time, wavelengths), wav_weight
-
-    def sample_ray_differential(self, time, wavelength_sample, position_sample, aperture_sample, active=True):
-        ray, weight = self.sample_ray(time, wavelength_sample, position_sample, aperture_sample, active)
-        return mi.RayDifferential3f(ray), weight
-
-    def sample_direction(self, it, sample, active=True):
-        # Fallback to base implementation; not used in standard path tracing.
-        return super().sample_direction(it, sample, active)
-
-
-# Register the new sensor
-mi.register_sensor("spherical", lambda props: SphericalCamera(props))
-
-class GTSphericalCamera(SphericalCamera):
     def __init__(self, props=mi.Properties()):
         super().__init__(props)
         self.initial_si = None
@@ -43,37 +15,24 @@ class GTSphericalCamera(SphericalCamera):
         self.product_cosine = False
 
     def sample_ray(self, time, wavelength_sample, position_sample, aperture_sample, active=True):
-        ray, wav_weight = super().sample_ray(time, wavelength_sample,
-                                             position_sample, aperture_sample, active)
+        wavelengths, weight = self.sample_wavelengths(dr.zeros(mi.SurfaceInteraction3f), wavelength_sample, active)
+        film_size = mi.Vector2f(self.film().crop_size())
+        d = dr.normalize(mi.warp.square_to_uniform_sphere(position_sample - 0.5 / film_size))
+        ray = mi.Ray3f(self.world_transform.translation(), d, time, wavelengths)
 
-        # Modify the starting weight if this is a GT render
-        if self.initial_si is not None and dr.any(self.initial_si.is_valid()):
-            si_active = active & self.initial_si.is_valid()
-            if dr.any(si_active):
-                si = self.initial_si
-                bsdf_ctx = mi.BSDFContext()
-                bsdf = si.bsdf()  # Get the BSDF at the intersection
+        si = self.initial_si
+        if si is not None:
+            wi_local = si.to_local(ray.d)
+            valid = active & si.is_valid()
+            if self.product_bsdf:
+                weight = dr.select(valid, weight * si.bsdf().eval(mi.BSDFContext(), si, wi_local, True), weight)
+            if self.product_cosine:
+                weight = dr.select(valid, weight * dr.abs(wi_local.z), weight)
+        return ray, weight
 
-                # The "outgoing" direction for our BSDF eval is towards the original camera.
-                wo_world = -si.wi
+    def sample_ray_differential(self, time, wavelength_sample, position_sample, aperture_sample, active=True):
+        ray, weight = self.sample_ray(time, wavelength_sample, position_sample, aperture_sample, active)
+        return mi.RayDifferential3f(ray), weight
 
-                # The "incoming" direction for our BSDF eval is the new ray's direction.
-                wi_world = ray.d
-
-                # Get the BSDF from the context
-                bsdf_to_eval = si.bsdf()
-                
-                wi_local = si.to_local(wi_world)  # incoming light direction
-                wo_local = si.to_local(wo_world)  # outgoing direction (to camera)
-
-                if self.product_bsdf:
-                    bsdf_val = bsdf.eval(bsdf_ctx, si, wi_local, active=True)
-                    wav_weight = dr.select(si_active, wav_weight * bsdf_val, wav_weight)
-
-                if self.product_cosine:
-                    cos_val = dr.abs(wi_local.z)
-                    wav_weight = dr.select(si_active, wav_weight * cos_val, wav_weight)
-
-        return ray, wav_weight
 
 mi.register_sensor("gt_spherical_camera", lambda props: GTSphericalCamera(props))

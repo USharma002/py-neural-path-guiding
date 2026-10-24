@@ -1,4 +1,4 @@
-"""Neural network for predicting vMF mixture parameters for path guiding."""
+"""tiny-cuda-nn network predicting vMF mixture parameters (Neural Parametric Mixtures, Dong et al. 2023)."""
 from __future__ import annotations
 
 import math
@@ -11,170 +11,46 @@ import torch.nn.functional as F
 
 
 class GuidingNetwork(nn.Module):
-    """Neural network using tiny-cuda-nn to predict vMF mixture model parameters.
-    
-    The network takes a 7D input (position, view direction, roughness) and
-    outputs the parameters for a mixture of K vMF distributions.
-    
-    Args:
-        device: Device to run the network on ('cuda' or 'cpu')
-        K: Number of lobes in the vMF mixture
+    """(pos in [0,1]^3, wi, normal, roughness) -> (lambda, kappa, theta, phi) for K lobes.
+
+    Position: 8-level dense grid, 4 features per level, resolutions 8..86; wi and normal:
+    spherical harmonics; roughness: raw auxiliary feature; decoder: 3-layer MLP of width 64.
     """
     def __init__(self, device: str, K: int = 8):
         super().__init__()
         self.device = device
         self.K = K
 
-        # Input: 3 (position) + 3 (direction) + 1 (roughness) = 7
-        input_dims = 7
-        # Output: 4 parameters per lobe (lambda, kappa, theta, phi)
-        output_dims = 4 * self.K
-        
-        config = {
-            "encoding": {
-                "otype": "Composite",
-                "nested": [
-                    {
-                        "n_dims_to_encode": 3,
-                        "otype": "HashGrid",
-                        "n_levels": 16,
-                        "n_features_per_level": 2,
-                        "log2_hashmap_size": 19,
-                        "base_resolution": 16,
-                        "per_level_scale": 1.5,
-                        "dtype": "float32",  
-                    },
-                    {
-                        "n_dims_to_encode": 4,
-                        "otype": "Identity",
-                        "dtype": "float32",  
-                    }
-                ]
-            },
-            "network": {
-                "otype": "FullyFusedMLP",
-                "activation": "ReLU",
-                "output_activation": "None", # IMPORTANT: Activations are applied manually
-                "n_neurons": 64,
-                "n_hidden_layers": 4,
-            }
+        encoding = {
+            "otype": "Composite",
+            "nested": [
+                {"n_dims_to_encode": 3, "otype": "DenseGrid", "n_levels": 8, "n_features_per_level": 4,
+                 "base_resolution": 8, "per_level_scale": (86 / 8) ** (1 / 7)},
+                {"n_dims_to_encode": 3, "otype": "SphericalHarmonics", "degree": 4},
+                {"n_dims_to_encode": 3, "otype": "SphericalHarmonics", "degree": 4},
+                {"n_dims_to_encode": 1, "otype": "Identity"},
+            ],
         }
+        network = {"otype": "FullyFusedMLP", "activation": "ReLU", "output_activation": "None",
+                   "n_neurons": 64, "n_hidden_layers": 3}
 
         self.model = tcnn.NetworkWithInputEncoding(
-            n_input_dims=input_dims,
-            n_output_dims=output_dims,
-            encoding_config=config["encoding"],
-            network_config=config["network"],
+            n_input_dims=10, n_output_dims=4 * self.K, encoding_config=encoding, network_config=network,
         ).to(self.device)
 
-    def _prepare_input(
-        self, 
-        positions: torch.Tensor, 
-        view_dirs: torch.Tensor, 
-        roughness: torch.Tensor
-    ) -> torch.Tensor:
-        """Concatenate and validate network inputs.
-        
-        Args:
-            positions: World positions, normalized to [-1, 1]^3
-            view_dirs: View direction vectors
-            roughness: Surface roughness values
-            
-        Returns:
-            Concatenated input tensor for the network
-        """
-        # A more robust implementation would normalize position based on the scene AABB
-        if roughness.ndim == 1:
-            roughness = roughness.unsqueeze(1)
-
-        positions = (positions + 1.0) / 2.0
-
-        input_tensor = torch.cat([positions, view_dirs, roughness], dim=1)
-        return input_tensor
-
     def network_output_to_params(self, network_output: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Convert raw network output into vMF parameters.
-        
-        Args:
-            network_output: Raw network output tensor of shape (N, 4*K)
-            
-        Returns:
-            Dictionary with keys 'lambda', 'kappa', 'theta', 'phi',
-            each of shape (N, K)
-        """
-        # Reshape flat output: (N, 4*K) -> (N, K, 4)
-        raw_params = network_output.view(-1, self.K, 4)
-
-        # Split into individual raw parameters
-        raw_log_lambda = raw_params[..., 0]
-        raw_kappa = raw_params[..., 1]
-        raw_theta_logit = raw_params[..., 2]
-        raw_phi_logit = raw_params[..., 3]
-
-        # 1. Lambda & Kappa: Use softplus for positive values
-        lambda_ = F.softplus(raw_log_lambda) + 1e-5
-        kappa = F.softplus(raw_kappa) + 1e-4
-
-        # 2. Theta & Phi: Use sigmoid to map to (0,1), then scale to the correct range.
-        theta = torch.sigmoid(raw_theta_logit) * math.pi      # Maps to range [0, pi]
-        phi = torch.sigmoid(raw_phi_logit) * 2 * math.pi    # Maps to range [0, 2*pi]
-
-        kappa = torch.clamp(kappa, min=1e-5, max=1000.0)
-        
+        """(N, 4K) raw output -> (N, K) tensors: lambda = softmax, kappa = exp, theta / phi via sigmoid."""
+        raw = network_output.float().view(-1, self.K, 4)
         return {
-            "lambda": lambda_,  # Shape: (N, K)
-            "kappa": kappa,     # Shape: (N, K)
-            "theta": theta,     # Shape: (N, K)
-            "phi": phi          # Shape: (N, K)
+            "lambda": F.softmax(raw[..., 0], dim=-1),
+            "kappa": torch.exp(raw[..., 1]),
+            "theta": torch.sigmoid(raw[..., 2]) * math.pi,
+            "phi": torch.sigmoid(raw[..., 3]) * 2 * math.pi,
         }
 
-    def query(
-        self, 
-        positions: torch.Tensor, 
-        view_dirs: torch.Tensor, 
-        roughness: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        """Query the network for vMF parameters (inference mode).
-        
-        Args:
-            positions: World positions, normalized to [-1, 1]^3
-            view_dirs: View direction vectors
-            roughness: Surface roughness values
-            
-        Returns:
-            Dictionary of vMF mixture parameters
-        """
-        # Set to evaluation mode and disable gradients for inference speed
-        self.model.eval()
-        
-        with torch.no_grad():
-            input_tensor = self._prepare_input(positions, view_dirs, roughness)
-            # The network expects inputs in the [0, 1] range.
-            raw_output = self.model(input_tensor.to(self.device))
-        
-        # Process the raw output to get meaningful parameters
-        return self.network_output_to_params(raw_output)
-
-    def forward(
-        self, 
-        positions: torch.Tensor, 
-        view_dirs: torch.Tensor, 
-        roughness: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        """Forward pass for training (gradients are tracked).
-        
-        Args:
-            positions: World positions, normalized to [-1, 1]^3
-            view_dirs: View direction vectors
-            roughness: Surface roughness values
-            
-        Returns:
-            Dictionary of vMF mixture parameters
-        """
-        # Note: No model.eval() and no torch.no_grad()
-        input_tensor = self._prepare_input(positions, view_dirs, roughness)
-
-        # The tcnn model handles the device placement
-        raw_output = self.model(input_tensor.contiguous())
-        
-        return self.network_output_to_params(raw_output)
+    def forward(self, pos01, wi01, normal01, roughness) -> Dict[str, torch.Tensor]:
+        """All inputs already mapped to [0, 1]."""
+        if roughness.ndim == 1:
+            roughness = roughness.unsqueeze(1)
+        x = torch.cat([pos01, wi01, normal01, roughness], dim=1).contiguous()
+        return self.network_output_to_params(self.model(x))
