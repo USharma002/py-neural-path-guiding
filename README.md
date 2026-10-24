@@ -1,8 +1,8 @@
 # Neural Path Guiding
 
-A modular Neural Path Guiding framework for Mitsuba 3, implemented in Python.
-This project provides a flexible environment for prototyping modern path-guiding techniques, neural importance sampling methods, and directional distribution models.
-It also includes a PyQt-based GUI viewer for inspecting Mitsuba scene renders, visualizing spherical PDFs, and debugging guiding behavior.
+A neural path guiding framework for Mitsuba 3, implemented in Python for learning and experimentation.
+It implements three published guiding methods on a shared path tracer, a neural radiance cache, and a
+PyQt viewer for inspecting renders, guiding distributions and training data.
 
 ![App Screenshot](assets/app.png)
 
@@ -14,26 +14,40 @@ It also includes a PyQt-based GUI viewer for inspecting Mitsuba scene renders, v
 
 *View interactive sliders, variance heatmaps, and RelMSE metrics directly in your browser.*
 
-### Method Comparison (Equal Time)
+### Method Comparison (Equal Samples)
 
-| Ground Truth (20k SPP) | Baseline (Unguided) | Neural Guiding (vMF) | Neural Guiding (DF)  |
+| Ground Truth (10k SPP) | Baseline (Unguided) | Neural Guiding (vMF) | Neural Guiding (DF)  |
 | :---: | :---: | :---: | :---: |
 | <img src="docs/assets/gt_render_10000/view_rgb.png" width="250"> | <img src="docs/assets/unguided_render_1000/view_rgb.png" width="250"> | <img src="docs/assets/vmf_render_1000/view_rgb.png" width="250"> | <img src="docs/assets/df_render_1000/view_rgb.png" width="250"> |
 
-> **Note:** The above images demonstrate convergence at **equal sample (1000)**. 
+> **Note:** The images show the Cornell box at **1000 spp** per method. They were rendered with an earlier version of the methods.
+
 ---
 
-## Features Implemented
+## Guiding Methods
 
-### Rendering and Visualization
-- PyQt viewer for interactive Mitsuba 3 scene inspection
-- Click-to-inspect spherical PDF visualization
-- Debug views for guiding structures and neural models
+Each method follows its paper: it learns the product of BSDF, incident radiance and cosine, trained with the
+Monte Carlo KL-divergence gradient weighted by `f · L_i · cos / p`, where `p` is the density that sampled the direction.
 
-### Path Guiding Implemented
-- Distribution Factorization
-- Neural Importance Sampling
-- vMF Mixture Model
+| Method | Paper | Representation |
+| --- | --- | --- |
+| **NPM (vMF)** | Dong et al., *Neural Parametric Mixtures for Path Guiding*, SIGGRAPH 2023 | Network-predicted mixture of 8 von Mises-Fisher lobes |
+| **NIS** | Müller et al., *Neural Importance Sampling*, TOG 2019 | Piecewise-quadratic coupling flow, MIS-aware training |
+| **DF** | Figueiredo et al., *Neural Path Guiding with Distribution Factorization*, EGSR 2025 | Marginal and conditional 1D grids; uses the NRC as its radiance cache |
+
+The **Neural Radiance Cache** (Müller et al., *Real-time Neural Radiance Caching for Path Tracing*, 2021) can
+also terminate paths early during rendering.
+
+Guided directions are combined with BSDF sampling by one-sample MIS, and next-event estimation weights against
+the same mixture density.
+
+## Viewer
+
+- Real-time rendering with online training of the guide and the NRC
+- Click a pixel to see the incident radiance, the learned guiding distribution (2D and an interactive 3D sphere)
+  and the NRC prediction at that point
+- Loss plots, frame accumulation with a variance view, and a browser for the recorded training data
+- Ground-truth export at equal samples or equal time
 
 ---
 
@@ -53,46 +67,33 @@ python main.py
 ```
 
 Notes:
-- The project expects a CUDA-capable setup for the main rendering and training paths.
-- 3D sphere visualization is optional and depends on `PyQt6-WebEngine` support in your environment.
-
----
-
+- A CUDA GPU is required (Mitsuba `cuda_ad_rgb` and tiny-cuda-nn).
+- The 3D sphere view is optional and needs `PyQt6-WebEngine`.
 
 ---
 
 ## Project Structure
 
-The repository is organized into the following key modules:
+- `integrators/` — the path tracer shared by all methods: BSDF/guide MIS, NEE, NRC termination, and per-vertex
+  recording of training data
+- `guiding/` — the guiding methods; each defines its distribution and a small integrator subclass that chooses
+  what to record and how to build its training batch (`registry.py` lists the methods shown in the viewer)
+- `networks/` — the vMF parameter network and the neural radiance cache
+- `distributions/` — the batched vMF mixture
+- `rendering/` — frame-by-frame renderer and the built-in test scene
+- `sensor/` — the hemisphere camera used by the inspection panel
+- `ui/` — PyQt viewer and dialogs
+- `utils/` — math and visualization helpers
 
-- `guiding/` — Path guiding algorithms and integrators
-- `distributions/` — Spatial and directional density models, including vMF mixtures
-- `networks/` — Neural network components for sampling and radiance estimation
-- `ui/` — PyQt-based visualization and inspection tools
-- `rendering/` — Mitsuba integration utilities and rendering helpers
-- `utils/` — Common math, logging, and support utilities
-
-This modular structure enables easy experimentation and replacement of guiding methods, distributions, and neural models.
+To add a method, implement a `GuidingDistribution`, subclass `PathGuidingIntegrator` next to it, and register
+the subclass in `guiding/registry.py`.
 
 ---
 
 ## Notes
 
-This repository is a research-focused prototype.
-It is designed for clarity and flexibility rather than production performance.
-Useful for experimenting with neural path guiding, importance sampling, and radiance learning inside Mitsuba 3.
-
----
-
-## Roadmap
-
-Planned or in-progress work includes:
-
-- Add new guiding methods (WIP)
-- Expanded Neural Radiance Cache pipeline (WIP)
-- Improved visualization and debugging tools (added training data visualization)
-- Example scripts and notebooks for experiments
-- Speed Improvements (will try to Implement using new Drjit Neural Networks)
+This repository is a learning project. It favors clarity over rendering speed: the guided integrator calls
+PyTorch networks from inside the Mitsuba path loop, which is much slower than Mitsuba's own path tracer.
 
 ---
 
